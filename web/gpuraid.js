@@ -153,7 +153,7 @@ app.registerExtension({
         { path: ["Extensions", "GPU RAID"], commands: ["GPURaid.RunOnWorker"] },
     ],
     aboutPageBadges: [
-        { label: "GPU RAID", url: "https://github.com/weloyo3000/MultiDiffusion", icon: "pi pi-server" },
+        { label: "GPU RAID", url: "https://github.com/Weloyo/ComfyUI-GPU-RAID", icon: "pi pi-server" },
     ],
     setup() {
         injectCss();

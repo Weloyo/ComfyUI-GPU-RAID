@@ -6,7 +6,7 @@ license = { file = "LICENSE" }
 dependencies = []
 
 [project.urls]
-Repository = "https://github.com/weloyo3000/MultiDiffusion"
+Repository = "https://github.com/Weloyo/ComfyUI-GPU-RAID"
 
 [tool.comfy]
 PublisherId = ""

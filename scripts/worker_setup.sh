@@ -17,7 +17,7 @@ set -euo pipefail
 
 PORT="${1:-8188}"
 COMFY_DIR="${2:-}"
-REPO_URL="${GPURAID_REPO:-https://github.com/weloyo3000/MultiDiffusion}"
+REPO_URL="${GPURAID_REPO:-https://github.com/Weloyo/ComfyUI-GPU-RAID}"
 
 if [[ -z "${GPURAID_TOKEN:-}" ]]; then
     echo "ОШИБКА: задайте токен:  export GPURAID_TOKEN=\"...\"" >&2

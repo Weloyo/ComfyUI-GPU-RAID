@@ -9,7 +9,7 @@
    Port: 8188**.
 2. В веб-терминале пода:
    ```bash
-   git clone https://github.com/weloyo3000/MultiDiffusion /workspace/gpu-raid
+   git clone https://github.com/Weloyo/ComfyUI-GPU-RAID /workspace/gpu-raid
    export GPURAID_TOKEN="придумайте-длинный-секрет"
    bash /workspace/gpu-raid/scripts/worker_setup.sh 8188
    ```
