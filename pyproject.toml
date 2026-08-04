@@ -1,0 +1,13 @@
+[project]
+name = "comfyui-gpu-raid"
+description = "Distributed generation for ComfyUI: stripe variants, tiled upscale and video jobs across local GPU + cloud workers (Kaggle, Colab Pro, RunPod) over authenticated tunnels. Pull architecture - the master is never exposed."
+version = "0.1.0"
+license = { file = "LICENSE" }
+dependencies = []
+
+[project.urls]
+Repository = "https://github.com/weloyo3000/MultiDiffusion"
+
+[tool.comfy]
+PublisherId = ""
+DisplayName = "GPU RAID (distributed generation)"

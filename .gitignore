@@ -1,0 +1,10 @@
+__pycache__/
+*.pyc
+tests/*.log
+.ipynb_checkpoints/
+*.part
+*.tmp
+.vscode/
+.idea/
+# состояние живёт в ComfyUI/user/default/gpu-raid/, не в репо
+workers.json

@@ -1,0 +1,70 @@
+/* GPU RAID panel */
+.gr-panel { padding: 6px; font-size: 12px; overflow-y: auto; height: 100%; }
+.gr-section { margin-bottom: 8px; border: 1px solid var(--border-color, #444);
+    border-radius: 6px; background: var(--comfy-menu-bg, #202020); }
+.gr-section > summary { cursor: pointer; padding: 6px 8px; font-weight: 600; user-select: none; }
+.gr-body { padding: 6px 8px; display: flex; flex-direction: column; gap: 6px; }
+
+.gr-muted { opacity: 0.65; }
+.gr-err { color: #e66; }
+.gr-grow { flex: 1 1 auto; min-width: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.gr-subtitle { font-weight: 600; margin: 4px 0; }
+.gr-clip { max-height: 2.4em; overflow: hidden; }
+
+.gr-dot { width: 9px; height: 9px; border-radius: 50%; display: inline-block; flex: none; }
+.gr-dot-green { background: #4caf50; }
+.gr-dot-red { background: #e05252; }
+.gr-dot-gray { background: #888; }
+
+.gr-worker { border-bottom: 1px dashed var(--border-color, #444); padding: 4px 0; }
+.gr-worker-head { display: flex; align-items: center; gap: 6px; }
+.gr-name { font-weight: 600; white-space: nowrap; }
+
+.gr-chip { border-radius: 8px; padding: 0 6px; font-size: 11px; }
+.gr-chip-green { background: #2c5f2d; color: #cfc; }
+.gr-chip-yellow { background: #6b5a1e; color: #ffe9a0; }
+.gr-chip-red { background: #6b2222; color: #ffc9c9; }
+
+.gr-btns { display: flex; flex-wrap: wrap; gap: 4px; margin-top: 4px; align-items: center; }
+.gr-btn { background: var(--comfy-input-bg, #333); color: var(--input-text, #ddd);
+    border: 1px solid var(--border-color, #555); border-radius: 4px; padding: 3px 8px;
+    cursor: pointer; font-size: 12px; }
+.gr-btn:hover { filter: brightness(1.2); }
+.gr-btn.gr-primary { background: #2d5f8a; border-color: #3a76a8; color: #fff; }
+.gr-btn.gr-danger { border-color: #a05252; color: #e99; }
+.gr-btn.gr-small { padding: 1px 6px; font-size: 11px; }
+.gr-btn.gr-wide { width: 100%; text-align: left; }
+
+.gr-textarea, .gr-input, .gr-select { width: 100%; box-sizing: border-box;
+    background: var(--comfy-input-bg, #2a2a2a); color: var(--input-text, #ddd);
+    border: 1px solid var(--border-color, #555); border-radius: 4px; padding: 4px 6px;
+    font-size: 12px; }
+.gr-input.gr-tiny { width: 64px; }
+.gr-row { display: flex; align-items: center; gap: 6px; }
+.gr-row .gr-label { flex: none; width: 90px; opacity: 0.8; }
+
+.gr-job { border: 1px solid var(--border-color, #444); border-radius: 6px; padding: 6px; }
+.gr-bar { height: 8px; border-radius: 4px; background: var(--comfy-input-bg, #333);
+    overflow: hidden; margin: 4px 0; }
+.gr-bar-fill { height: 100%; background: linear-gradient(90deg, #2d8a5f, #4caf50); transition: width 0.4s; }
+.gr-unit { font-size: 11px; }
+.gr-hist { border-bottom: 1px dashed var(--border-color, #444); padding: 3px 0; }
+
+.gr-proj { display: flex; align-items: center; justify-content: space-between; gap: 6px;
+    padding: 3px 0; border-bottom: 1px dashed var(--border-color, #444); }
+
+.gr-seg { display: flex; gap: 8px; border: 1px solid var(--border-color, #444);
+    border-radius: 6px; padding: 5px; margin: 4px 0; }
+.gr-seg-off { opacity: 0.45; }
+.gr-video { width: 150px; max-height: 100px; border-radius: 4px; background: #000; flex: none; }
+.gr-video-stub { display: flex; align-items: center; justify-content: center; color: #999;
+    height: 84px; }
+.gr-seg-meta { flex: 1 1 auto; min-width: 0; }
+.gr-parity { padding: 3px 0 3px 14px; }
+.gr-parity-line { display: flex; flex-wrap: wrap; gap: 4px; align-items: center; padding: 2px 0; }
+
+.gr-overlay { position: fixed; inset: 0; background: rgba(0, 0, 0, 0.5); z-index: 10000;
+    display: flex; align-items: center; justify-content: center; }
+.gr-dialog { background: var(--comfy-menu-bg, #222); border: 1px solid var(--border-color, #555);
+    border-radius: 8px; padding: 14px; min-width: 320px; display: flex;
+    flex-direction: column; gap: 6px; }
