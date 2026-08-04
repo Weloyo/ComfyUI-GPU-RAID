@@ -28,6 +28,16 @@ CLOUDFLARED_URL = (
 HF_PRESETS = {
     # preset -> [(repo_id, filename_in_repo, model_folder)]
     "sdxl": [("stabilityai/stable-diffusion-xl-base-1.0", "sd_xl_base_1.0.safetensors", "checkpoints")],
+    # MiniMax H3 (release 2026-08-03, Comfy-Org repackaged), суммарно ~40 ГБ.
+    # Репо под MiniMax H3 Community License — может требовать accept на странице HF
+    # и HF_TOKEN. Качается в HF-кэш (эфемерный диск) + симлинк: лимит 20 ГБ
+    # /kaggle/working не задевается. На Kaggle запускать в ОДНОинстансном режиме.
+    "minimax_h3": [
+        ("Comfy-Org/MiniMax-H3", "diffusion_models/minimax_h3_fl2va_pruned_int8_convrot.safetensors", "diffusion_models"),
+        ("Comfy-Org/MiniMax-H3", "text_encoders/qwen3vl_32b_minimax_h3_nvfp4_awq.safetensors", "text_encoders"),
+        ("Comfy-Org/MiniMax-H3", "vae/minimax_h3_video_vae_fp16.safetensors", "vae"),
+        ("Comfy-Org/MiniMax-H3", "vae/minimax_h3_audio_vae_fp32.safetensors", "vae"),
+    ],
     "none": [],
 }
 
