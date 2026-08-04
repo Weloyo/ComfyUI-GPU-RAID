@@ -173,6 +173,16 @@ export class GPURaidPanel {
                         .then(() => this.checkWorker(w.id));
                     line.appendChild(b);
                 }
+                const manual = el("button", { class: "gr-btn gr-small",
+                    title: "указать имя файла на воркере вручную" }, "→ вручную…");
+                manual.onclick = () => {
+                    const target = prompt(
+                        `Имя модели НА ВОРКЕРЕ вместо «${name}» (папка ${folder}):`, name);
+                    if (target && target.trim()) this.patchWorker(w.id,
+                        { add_remap: { folder, master: name, worker: target.trim() } })
+                        .then(() => this.checkWorker(w.id));
+                };
+                line.appendChild(manual);
                 const dl = el("button", { class: "gr-btn gr-small" }, "Скачать на воркера…");
                 dl.onclick = () => this.downloadToWorker(w.id, folder, name);
                 line.appendChild(dl);
