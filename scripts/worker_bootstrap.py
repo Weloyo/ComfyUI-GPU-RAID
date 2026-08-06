@@ -145,7 +145,22 @@ def _link(src, comfy_dir, folder, name):
         return 0
 
 
-def hf_download(preset_or_list, comfy_dir, hf_token=None):
+def hf_download(preset_or_list, comfy_dir, hf_token=None, drive_cache_dir=None):
+    """Скачивает модели пресета в comfy_dir/models/<folder>/.
+
+    HF-кэш (huggingface_hub) всегда остаётся на локальном диске — заворачивать
+    его в Google Drive нельзя: Drive FUSE-mount ненадёжен для вложенных
+    symlink-цепочек snapshot->blob, которые использует кэш huggingface_hub
+    (проверено на живой Colab-сессии: 3 из 4 файлов по 5-20 ГБ тихо "терялись"
+    — os.path.lexists() был True, os.path.exists() False). Поэтому:
+
+    - итоговый файл в comfy_dir/models/... — всегда РЕАЛЬНАЯ копия с
+      локального HF-кэша (не symlink на Drive);
+    - drive_cache_dir (если передан) используется только как плоское
+      персистентное хранилище готовых файлов между сессиями: если файл там
+      уже есть — копируем его оттуда вместо скачивания; иначе после скачивания
+      сохраняем туда копию для следующих сессий.
+    """
     items = HF_PRESETS.get(preset_or_list, preset_or_list if isinstance(preset_or_list, list) else [])
     if not items:
         return
@@ -154,17 +169,31 @@ def hf_download(preset_or_list, comfy_dir, hf_token=None):
     from huggingface_hub import hf_hub_download
 
     for repo_id, filename, folder in items:
+        name = os.path.basename(filename)
         dst_dir = os.path.join(comfy_dir, "models", folder)
         os.makedirs(dst_dir, exist_ok=True)
-        if os.path.exists(os.path.join(dst_dir, os.path.basename(filename))):
+        dst = os.path.join(dst_dir, name)
+        if os.path.exists(dst):
             print(f"[hf] уже есть: {filename}")
             continue
+
+        drive_path = os.path.join(drive_cache_dir, folder, name) if drive_cache_dir else None
+        if drive_path and os.path.exists(drive_path) and os.path.getsize(drive_path) > 0:
+            print(f"[hf] копирую из Drive-кэша: {filename}")
+            shutil.copy(drive_path, dst)
+            continue
+
         print(f"[hf] скачиваю {repo_id}/{filename} -> {folder}")
         path = hf_hub_download(repo_id=repo_id, filename=filename, token=hf_token or None)
         try:
-            os.symlink(path, os.path.join(dst_dir, os.path.basename(filename)))
+            os.symlink(path, dst)
         except OSError:
-            shutil.copy(path, dst_dir)
+            shutil.copy(path, dst)
+
+        if drive_path:
+            os.makedirs(os.path.dirname(drive_path), exist_ok=True)
+            print(f"[hf] сохраняю в Drive-кэш: {filename}")
+            shutil.copy(os.path.realpath(dst), drive_path)
 
 
 def model_inventory(comfy_dir):
@@ -306,7 +335,7 @@ def connection_string(token, url, name):
 
 def bring_up(gpuraid_src, comfy_dir, token, gpus=(0,), base_port=8188,
              extra_args=(), use_datasets=True, hf_preset="none", hf_token=None,
-             name_prefix="worker"):
+             name_prefix="worker", drive_cache_dir=None):
     """Полный цикл: установка -> модели -> запуск N инстансов -> auth -> туннели.
 
     Возвращает {"strings": [...], "procs": [...], "urls": [...]}.
@@ -316,7 +345,7 @@ def bring_up(gpuraid_src, comfy_dir, token, gpus=(0,), base_port=8188,
     if use_datasets:
         link_kaggle_datasets(comfy_dir)
     if hf_preset and hf_preset != "none":
-        hf_download(hf_preset, comfy_dir, hf_token)
+        hf_download(hf_preset, comfy_dir, hf_token, drive_cache_dir=drive_cache_dir)
     print("[models] инвентарь:")
     model_inventory(comfy_dir)
     if shutil.which("ffmpeg") is None:
