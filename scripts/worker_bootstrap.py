@@ -340,6 +340,12 @@ def bring_up(gpuraid_src, comfy_dir, token, gpus=(0,), base_port=8188,
 
     Возвращает {"strings": [...], "procs": [...], "urls": [...]}.
     """
+    if hf_preset == "minimax_h3":
+        # ~35-40 ГБ весов при 32 ГБ RAM без свопа (Kaggle/Colab): держать их в RAM
+        # нельзя — сессию убивает OOM (Kaggle "status code 42"). Стримим с NVMe.
+        need = ("--fast-disk", "--disable-pinned-memory", "--cache-none")
+        extra_args = tuple(extra_args) + tuple(f for f in need if f not in extra_args)
+        print(f"[minimax_h3] RAM-guard: extra_args = {extra_args}")
     install_comfy(comfy_dir)
     install_custom_nodes(comfy_dir, gpuraid_src)
     if use_datasets:
