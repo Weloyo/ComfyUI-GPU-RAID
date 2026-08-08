@@ -88,6 +88,17 @@
     border-radius: 8px; padding: 14px; min-width: 320px; display: flex;
     flex-direction: column; gap: 6px; }
 
+/* подключения (внешние регистрации) */
+.gr-conn { border: 1px solid var(--border-color, #444); border-radius: 6px;
+    padding: 4px 6px; margin: 4px 0; }
+.gr-conn > summary { cursor: pointer; user-select: none; list-style: none; }
+.gr-conn > summary::-webkit-details-marker { display: none; }
+.gr-conn-head { display: flex; align-items: center; gap: 6px; }
+.gr-conn-body { display: flex; flex-direction: column; gap: 5px; padding-top: 5px;
+    border-top: 1px dashed var(--border-color, #444); margin-top: 5px; }
+.gr-conn a.gr-btn { text-decoration: none; }
+.gr-steps { margin: 2px 0 2px 18px; padding: 0; opacity: 0.8; line-height: 1.4; }
+
 /* ------------------------------------------------------------------ */
 /* UI внутри нод на канве (пульты GPU RAID)                            */
 /* ------------------------------------------------------------------ */

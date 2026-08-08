@@ -144,6 +144,10 @@ DEFAULT_SETTINGS = {
         "gist_id": "",
         "poll_s": 30,
     },
+    # результат последней проверки каждого подключения (см. providers.py):
+    # {provider_id: {"ok": bool, "detail": str, "ts": int}} — переживает рестарт,
+    # чтобы панель не переспрашивала уже настроенное
+    "connections": {},
 }
 
 # небольшой каталог проверенных URL для «Download to worker»

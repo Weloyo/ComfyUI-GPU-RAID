@@ -7,6 +7,7 @@ import { app } from "../../../scripts/app.js";
 import { gr, toast } from "./api.js";
 import { el, esc, fmtDur, fmtGb, platformBadge, stateDot } from "./format.js";
 import { openProjectOnCanvas } from "./nodeui.js";
+import { ConnectionsUI } from "./connections.js";
 
 export class GPURaidPanel {
     constructor(root) {
@@ -106,9 +107,12 @@ export class GPURaidPanel {
     build() {
         this.root.classList.add("gr-panel");
         this.root.innerHTML = "";
+        this._summaries = {};
         const mk = (id, title, open = true) => {
             const box = el("details", { class: "gr-section", ...(open ? { open: "" } : {}) });
-            box.appendChild(el("summary", {}, title));
+            const sum = el("summary", {}, title);
+            box.appendChild(sum);
+            this._summaries[id] = sum;
             const body = el("div", { class: "gr-body", id: `gr-${id}` });
             box.appendChild(body);
             this.root.appendChild(box);
@@ -117,11 +121,17 @@ export class GPURaidPanel {
         this.elModes = mk("modes", "Режимы");
         this.elWorkers = mk("workers", "Воркеры");
         this.elAdd = mk("add", "Добавить воркеров", false);
+        this.elConn = mk("connections", "Подключения и ключи", false);
         this.elJobs = mk("jobs", "Задания");
         this.elProjects = mk("projects", "Проекты видео", false);
         this.elHistory = mk("history", "История", false);
         this.buildModes();
         this.buildAdd();
+        this.connections = new ConnectionsUI(this.elConn);
+        this.connections.onSummary = (ok, total) => {
+            this._summaries.connections.textContent =
+                `Подключения и ключи — ${ok}/${total}`;
+        };
     }
 
     row(label, ...controls) {
@@ -164,63 +174,10 @@ export class GPURaidPanel {
             presets.appendChild(b);
         }
         box.appendChild(presets);
-
-        const d = el("details", { class: "gr-subdetails" });
-        d.appendChild(el("summary", {}, "Настройки LLM (Сценарист)"));
-        this.llmUrl = el("input", { class: "gr-input",
-            placeholder: "base_url: http://127.0.0.1:11434/v1 (Ollama/LM Studio/OpenRouter)" });
-        this.llmModel = el("input", { class: "gr-input", placeholder: "модель, напр. qwen2.5:32b" });
-        this.llmKey = el("input", { class: "gr-input", type: "password",
-            placeholder: "API-ключ (не обязателен для локальных LLM)" });
-        this.llmSaved = el("span", { class: "gr-muted" });
-        const save = el("button", { class: "gr-btn gr-primary" }, "Сохранить");
-        save.onclick = async () => {
-            try {
-                await gr.patch("/settings", { llm: {
-                    base_url: this.llmUrl.value.trim(), model: this.llmModel.value.trim(),
-                } });
-                if (this.llmKey.value.trim()) {
-                    await gr.post("/secrets", { llm_api_key: this.llmKey.value.trim() });
-                }
-                this.llmKey.value = "";
-                toast("success", "Настройки LLM сохранены");
-                this.refreshSettings();
-            } catch (e) { toast("error", "Не сохранено", e.message); }
-        };
-        d.appendChild(this.row("URL", this.llmUrl));
-        d.appendChild(this.row("Модель", this.llmModel));
-        d.appendChild(this.row("Ключ", this.llmKey, this.llmSaved));
-        d.appendChild(save);
-        box.appendChild(d);
-
-        const rd = el("details", { class: "gr-subdetails" });
-        rd.appendChild(el("summary", {}, "Автоподключение воркеров (gist) и секреты"));
-        this.gistId = el("input", { class: "gr-input",
-            placeholder: "gist_id приватного гиста — тот же вписывается в ноутбуки" });
-        this.ghToken = el("input", { class: "gr-input", type: "password",
-            placeholder: "GitHub-токен (fine-grained, только право на Gists)" });
-        this.kaggleJson = el("textarea", { class: "gr-textarea", rows: "2",
-            placeholder: 'kaggle.json для автозапуска Kaggle: {"username":..., "key":...}' });
-        this.rdSaved = el("span", { class: "gr-muted" });
-        const rdSave = el("button", { class: "gr-btn gr-primary" }, "Сохранить");
-        rdSave.onclick = async () => {
-            try {
-                await gr.patch("/settings", { rendezvous: { gist_id: this.gistId.value.trim() } });
-                const sp = {};
-                if (this.ghToken.value.trim()) sp.gh_token = this.ghToken.value.trim();
-                if (this.kaggleJson.value.trim()) sp.kaggle_json = this.kaggleJson.value.trim();
-                if (Object.keys(sp).length) await gr.post("/secrets", sp);
-                this.ghToken.value = "";
-                this.kaggleJson.value = "";
-                toast("success", "Автоподключение настроено");
-                this.refreshSettings();
-            } catch (e) { toast("error", "Не сохранено", e.message); }
-        };
-        rd.appendChild(this.row("Gist", this.gistId));
-        rd.appendChild(this.row("GH-токен", this.ghToken, this.rdSaved));
-        rd.appendChild(this.kaggleJson);
-        rd.appendChild(rdSave);
-        box.appendChild(rd);
+        box.appendChild(el("div", { class: "gr-muted" },
+            "Ключи LLM, GitHub, Kaggle, HF и Civitai — в разделе "
+            + "«Подключения и ключи»: там же ссылки на страницы, где они берутся, "
+            + "и проверка одной кнопкой."));
     }
 
     renderModes() {
@@ -262,18 +219,6 @@ export class GPURaidPanel {
         }
         const cur = MODES.find((m) => m[0] === lc.policy);
         this.modesHint.textContent = cur ? cur[2] : "";
-
-        const llm = this.settings.llm || {};
-        if (document.activeElement !== this.llmUrl) this.llmUrl.value = llm.base_url || "";
-        if (document.activeElement !== this.llmModel) this.llmModel.value = llm.model || "";
-        this.llmSaved.textContent = this.secretsView.has_llm_key ? "ключ сохранён ✓" : "ключа нет";
-
-        const rdCfg = this.settings.rendezvous || {};
-        if (document.activeElement !== this.gistId) this.gistId.value = rdCfg.gist_id || "";
-        const flags = [];
-        if (this.secretsView.has_gh_token) flags.push("GH ✓");
-        if (this.secretsView.has_kaggle_json) flags.push("kaggle.json ✓");
-        this.rdSaved.textContent = flags.join(" · ") || "секретов нет";
     }
 
     // ------------------------------------------------------------- воркеры
@@ -450,7 +395,10 @@ export class GPURaidPanel {
             try {
                 const r = await gr.post("/kaggle/start", { model_preset: (preset || "none").trim() });
                 toast("success", "Kaggle-кернел запущен", r.kernel);
-            } catch (e) { toast("error", "Kaggle не запущен", e.message); }
+            } catch (e) {
+                toast("error", "Kaggle не запущен",
+                    `${e.message} — проверьте раздел «Подключения и ключи»`, 9000);
+            }
         };
         auto.append(this.colabBtn, kaggleBtn);
         box.appendChild(auto);
@@ -480,7 +428,7 @@ export class GPURaidPanel {
         if (this.colabBtn && lc.colab_notebook_url) this.colabBtn.href = lc.colab_notebook_url;
         if (!rd.configured) {
             this.rdStatus.textContent =
-                "автоподключение не настроено: gist_id + GH-токен в секции «Режимы»";
+                "автоподключение не настроено: раздел «Подключения и ключи» → GitHub";
             return;
         }
         const ago = rd.last_poll_ts ? Math.round(Date.now() / 1000 - rd.last_poll_ts) : null;

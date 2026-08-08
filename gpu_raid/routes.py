@@ -14,7 +14,8 @@ from aiohttp import web
 
 import server
 
-from . import auth, config, downloads, events, kaggle_api, parity, results, storyplan
+from . import (auth, config, downloads, events, kaggle_api, parity, providers,
+               results, storyplan)
 from . import longvideo as lv
 from . import pipeline
 from . import secrets as secret_store
@@ -118,7 +119,7 @@ async def settings_get(request):
     })
 
 
-_SETTINGS_KEYS = ("lifecycle", "llm", "rendezvous", "timeouts",
+_SETTINGS_KEYS = ("lifecycle", "llm", "rendezvous", "timeouts", "connections",
                   "max_retries", "keep_last_jobs", "heartbeat_s", "free_after_job")
 
 
@@ -141,6 +142,85 @@ async def secrets_set(request):
         secret_store.save_kaggle_json(data.pop("kaggle_json"))
     secret_store.save(data)
     return web.json_response({"ok": True, "secrets": secret_store.public_view()})
+
+
+# ---------------------------------------------------------------------------
+# подключения: одно место для всех внешних регистраций (см. providers.py)
+# ---------------------------------------------------------------------------
+
+@routes.get("/gpuraid/connections")
+async def connections_get(request):
+    _guard_master(request)
+    return web.json_response(
+        providers.status_view(REGISTRY.settings(), secret_store.public_view()))
+
+
+@routes.post("/gpuraid/connections/{pid}")
+async def connections_save(request):
+    _guard_master(request)
+    pid = request.match_info["pid"]
+    data = await _json(request)
+    try:
+        await providers.save(pid, data)
+    except KeyError:
+        return _err(404, f"нет такого подключения: {pid}")
+    except ValueError as e:
+        return _err(400, e)
+    except Exception as e:
+        log.exception("connections save failed")
+        return _err(500, e)
+    result = await providers.check(pid) if data.get("check", True) else {}
+    return web.json_response({
+        "ok": True, "check": result,
+        "status": providers.status_view(REGISTRY.settings(), secret_store.public_view()),
+    })
+
+
+@routes.post("/gpuraid/connections/{pid}/check")
+async def connections_check(request):
+    _guard_master(request)
+    pid = request.match_info["pid"]
+    try:
+        result = await providers.check(pid)
+    except KeyError:
+        return _err(404, f"нет такого подключения: {pid}")
+    return web.json_response({"check": result})
+
+
+@routes.post("/gpuraid/connections/{pid}/forget")
+async def connections_forget(request):
+    _guard_master(request)
+    pid = request.match_info["pid"]
+    try:
+        check = await providers.forget(pid)
+    except KeyError:
+        return _err(404, f"нет такого подключения: {pid}")
+    return web.json_response({
+        "check": check,
+        "status": providers.status_view(REGISTRY.settings(), secret_store.public_view()),
+    })
+
+
+@routes.post("/gpuraid/connections/{pid}/action/{action}")
+async def connections_action(request):
+    _guard_master(request)
+    pid, action = request.match_info["pid"], request.match_info["action"]
+    handlers = {
+        ("github", "create_gist"): providers.create_gist,
+        ("kaggle", "install_cli"): providers.install_kaggle_cli,
+    }
+    fn = handlers.get((pid, action))
+    if fn is None:
+        return _err(404, f"нет такого действия: {pid}/{action}")
+    try:
+        result = await fn()
+    except Exception as e:
+        return _err(409, e)
+    check = await providers.check(pid)
+    return web.json_response({
+        "result": result, "check": check,
+        "status": providers.status_view(REGISTRY.settings(), secret_store.public_view()),
+    })
 
 
 # ---------------------------------------------------------------------------
