@@ -1,19 +1,24 @@
-// Sidebar-панель GPU RAID: воркеры, задания, offload, Long Video, история.
+// Sidebar-панель GPU RAID: воркеры, режимы, глобальные настройки и мониторинг.
+//
+// Всё, что касается генерации (промпты, ключевые кадры, сегменты, запуск
+// offload/конвейера), живёт на канве в нодах — см. lib/nodeui.js и lib/editor.js.
+// Здесь остаётся только то, что применяется ко всему workflow целиком.
 import { app } from "../../../scripts/app.js";
-import { gr, toast, viewURL, clientId } from "./api.js";
-import { el, esc, fmtDur, fmtGb, stateDot } from "./format.js";
+import { gr, toast } from "./api.js";
+import { el, esc, fmtDur, fmtGb, platformBadge, stateDot } from "./format.js";
+import { openProjectOnCanvas } from "./nodeui.js";
+import { ConnectionsUI } from "./connections.js";
 
 export class GPURaidPanel {
     constructor(root) {
         this.root = root;
         this.workers = [];
         this.settings = {};
+        this.secretsView = {};
         this.jobs = new Map();       // job_id -> snapshot
         this.history = [];
         this.projects = [];
         this.parity = new Map();     // worker_id -> report
-        this.openProject = null;     // manifest
-        this.edit = { order: [], excluded: new Set(), trims: {} };
         this._timer = null;
         this.build();
         this.refreshAll();
@@ -51,11 +56,8 @@ export class GPURaidPanel {
             this.renderJobs();
             this.renderHistory();
         } else if (name === "longvideo") {
+            // сам проект перерисует нода на канве, панели хватит списка
             this.refreshProjects();
-            if (this.openProject && data.label === this.openProject.label && data.manifest) {
-                this.openProject = { ...this.openProject, ...data.manifest };
-                this.renderEditor();
-            }
         }
     }
 
@@ -63,17 +65,33 @@ export class GPURaidPanel {
 
     async refreshAll() {
         try {
-            const [w, j] = await Promise.all([gr.get("/workers"), gr.get("/jobs")]);
+            const [w, j, s] = await Promise.all([
+                gr.get("/workers"), gr.get("/jobs"), gr.get("/settings"),
+            ]);
             this.workers = w.workers || [];
-            this.settings = w.settings || {};
+            this.settings = s.settings || w.settings || {};
+            this.secretsView = s.secrets || {};
             for (const snap of j.active || []) this.jobs.set(snap.job_id, snap);
             this.history = j.history || this.history;
+            this.renderModes();
             this.renderWorkers();
             this.renderJobs();
             this.renderHistory();
-            this.renderOffload();
         } catch (e) { /* сервер занят/рестартует */ }
+        try {
+            this.lifecycle = await gr.get("/lifecycle");
+            this.renderLifecycle();
+        } catch (e) { /* ignore */ }
         this.refreshProjects();
+    }
+
+    async refreshSettings() {
+        try {
+            const s = await gr.get("/settings");
+            this.settings = s.settings || this.settings;
+            this.secretsView = s.secrets || {};
+            this.renderModes();
+        } catch (e) { /* ignore */ }
     }
 
     async refreshProjects() {
@@ -89,22 +107,118 @@ export class GPURaidPanel {
     build() {
         this.root.classList.add("gr-panel");
         this.root.innerHTML = "";
+        this._summaries = {};
         const mk = (id, title, open = true) => {
             const box = el("details", { class: "gr-section", ...(open ? { open: "" } : {}) });
-            box.appendChild(el("summary", {}, title));
+            const sum = el("summary", {}, title);
+            box.appendChild(sum);
+            this._summaries[id] = sum;
             const body = el("div", { class: "gr-body", id: `gr-${id}` });
             box.appendChild(body);
             this.root.appendChild(box);
             return body;
         };
+        this.elModes = mk("modes", "Режимы");
         this.elWorkers = mk("workers", "Воркеры");
         this.elAdd = mk("add", "Добавить воркеров", false);
+        this.elConn = mk("connections", "Подключения и ключи", false);
         this.elJobs = mk("jobs", "Задания");
-        this.elOffload = mk("offload", "Offload: весь workflow на воркера", false);
-        this.elLV = mk("lv", "Long Video", false);
+        this.elProjects = mk("projects", "Проекты видео", false);
         this.elHistory = mk("history", "История", false);
+        this.buildModes();
         this.buildAdd();
-        this.buildLV();
+        this.connections = new ConnectionsUI(this.elConn);
+        this.connections.onSummary = (ok, total) => {
+            this._summaries.connections.textContent =
+                `Подключения и ключи — ${ok}/${total}`;
+        };
+    }
+
+    row(label, ...controls) {
+        const r = el("div", { class: "gr-row" });
+        r.appendChild(el("span", { class: "gr-label" }, esc(label)));
+        for (const c of controls) r.appendChild(c);
+        return r;
+    }
+
+    // ------------------------------------------------------------- режимы
+
+    buildModes() {
+        const box = this.elModes;
+        box.innerHTML = "";
+        this.modesBar = el("div", { class: "gr-modes" });
+        box.appendChild(this.modesBar);
+        this.modesHint = el("div", { class: "gr-muted" });
+        box.appendChild(this.modesHint);
+
+        box.appendChild(el("div", { class: "gr-subtitle" }, "Сценарии"));
+        const presets = el("div", { class: "gr-modes" });
+        const CARDS = [
+            ["story_minimax_h3", "♾️ Бесконечное видео",
+             "Сценарист на MiniMax H3: сюжет → кадры → сегменты → видео любой длины. "
+             + "Вся работа — в ноде «Сценарист» на канве"],
+            ["pipeline_minimax_h3", "🐘 Большая модель",
+             "H3 по частям на нескольких GPU: загрузите пример и жмите «Проанализировать» "
+             + "в ноде «Конвейер»"],
+        ];
+        for (const [name, title, hint] of CARDS) {
+            const b = el("button", { class: "gr-btn gr-mode", title: hint }, esc(title));
+            b.onclick = async () => {
+                if (!confirm(`Загрузить пример «${title}»? Текущий workflow на канве будет заменён.`)) return;
+                try {
+                    const r = await gr.get(`/example/${name}`);
+                    await app.loadGraphData(r.workflow);
+                    toast("success", "Пример загружен", hint);
+                } catch (e) { toast("error", "Пример не загружен", e.message); }
+            };
+            presets.appendChild(b);
+        }
+        box.appendChild(presets);
+        box.appendChild(el("div", { class: "gr-muted" },
+            "Ключи LLM, GitHub, Kaggle, HF и Civitai — в разделе "
+            + "«Подключения и ключи»: там же ссылки на страницы, где они берутся, "
+            + "и проверка одной кнопкой."));
+    }
+
+    renderModes() {
+        if (!this.modesBar) return;
+        const bar = this.modesBar;
+        bar.innerHTML = "";
+        const lc = this.settings.lifecycle || {};
+        const MODES = [
+            ["keep", "⚡ Держать", "воркеры не останавливаются после заданий"],
+            ["eco", "🌙 Эко", "автостоп облачных воркеров после N минут простоя"],
+            ["instant", "⏻ Сразу гасить", "останавливать облачных воркеров сразу после задания"],
+            ["local_only", "🏠 Только локально", "облачные воркеры не используются"],
+        ];
+        for (const [key, title, hint] of MODES) {
+            const b = el("button", {
+                class: "gr-btn gr-mode" + (lc.policy === key ? " gr-mode-on" : ""),
+                title: hint,
+            }, esc(title));
+            b.onclick = async () => {
+                try { await gr.patch("/settings", { lifecycle: { policy: key } }); }
+                catch (e) { toast("error", "Ошибка", e.message); }
+                this.refreshSettings();
+            };
+            bar.appendChild(b);
+        }
+        if (lc.policy === "eco") {
+            const min = el("input", { class: "gr-input gr-tiny", type: "number", min: "1",
+                max: "180", value: String(lc.idle_stop_min ?? 10),
+                title: "минут простоя до автостопа" });
+            min.onchange = async () => {
+                try {
+                    await gr.patch("/settings", { lifecycle: {
+                        idle_stop_min: parseInt(min.value || "10", 10),
+                    } });
+                } catch (e) { /* ignore */ }
+            };
+            bar.appendChild(min);
+            bar.appendChild(el("span", { class: "gr-muted" }, "мин"));
+        }
+        const cur = MODES.find((m) => m[0] === lc.policy);
+        this.modesHint.textContent = cur ? cur[2] : "";
     }
 
     // ------------------------------------------------------------- воркеры
@@ -117,8 +231,12 @@ export class GPURaidPanel {
             const st = w.status || {};
             const row = el("div", { class: "gr-worker" });
             const head = el("div", { class: "gr-worker-head" });
-            head.appendChild(el("span", { class: `gr-dot ${stateDot(st.state)}` }));
+            head.appendChild(el("span", { class: `gr-dot ${stateDot(st.state)}`,
+                title: st.state === "stopped" ? "остановлен (lifecycle)" : (st.state || "") }));
             head.appendChild(el("span", { class: "gr-name", title: w.url }, esc(w.name)));
+            const badge = platformBadge(w.platform || st.platform ||
+                (w.kind === "cloud" ? "generic" : ""));
+            if (badge) head.appendChild(el("span", { class: "gr-badge" }, esc(badge)));
             const gpu = st.gpu ? `${st.gpu} · ${fmtGb(st.vram_total_gb)}` : (st.error ? esc(st.error) : "");
             head.appendChild(el("span", { class: "gr-muted gr-grow" },
                 esc(gpu) + (st.latency_ms != null ? ` · ${st.latency_ms}мс` : "")));
@@ -131,10 +249,30 @@ export class GPURaidPanel {
             const toggle = el("button", { class: "gr-btn" }, w.enabled ? "Выкл" : "Вкл");
             toggle.onclick = () => this.patchWorker(w.id, { enabled: !w.enabled });
             btns.appendChild(toggle);
-            const check = el("button", { class: "gr-btn" }, "Проверить");
+            const check = el("button", { class: "gr-btn",
+                title: "сверить ноды и модели воркера с текущим workflow на канве" }, "Проверить");
             check.onclick = () => this.checkWorker(w.id);
             btns.appendChild(check);
             if (w.id !== "local") {
+                const pin = el("button", {
+                    class: "gr-btn" + (w.pinned ? " gr-mode-on" : ""),
+                    title: "закреплён: автостоп жизненного цикла не трогает этого воркера",
+                }, "📌");
+                pin.onclick = () => this.patchWorker(w.id, { pinned: !w.pinned });
+                btns.appendChild(pin);
+                if (w.kind === "cloud" && st.state === "online") {
+                    const stop = el("button", { class: "gr-btn gr-danger",
+                        title: "остановить рантайм воркера (квота перестанет тратиться)" }, "⏻");
+                    stop.onclick = async () => {
+                        if (!confirm(`Остановить рантайм воркера «${w.name}»?`)) return;
+                        try {
+                            const r = await gr.post(`/workers/${w.id}/stop`);
+                            if (!r.stopped) toast("warn", "Воркер не остановлен — смотрите тосты");
+                            this.refreshAll();
+                        } catch (e) { toast("error", "Не остановлен", e.message); }
+                    };
+                    btns.appendChild(stop);
+                }
                 const edit = el("button", { class: "gr-btn" }, "URL");
                 edit.onclick = async () => {
                     const url = prompt("Новый URL воркера (токен и remap сохранятся):", w.url);
@@ -244,8 +382,31 @@ export class GPURaidPanel {
 
     buildAdd() {
         const box = this.elAdd;
+        const auto = el("div", { class: "gr-btns" });
+        this.colabBtn = el("a", { class: "gr-btn", target: "_blank", href: "#",
+            title: "откроется ноутбук — нажмите Run All; дальше воркер подключится сам (gist)" },
+            "▶ Открыть Colab-ноутбук");
+        const kaggleBtn = el("button", { class: "gr-btn",
+            title: "пуш batch-кернела через Kaggle API; нужен kaggle.json и настроенный gist" },
+            "▶ Запустить Kaggle-воркера");
+        kaggleBtn.onclick = async () => {
+            const preset = prompt("Пресет моделей для Kaggle (none | sdxl | minimax_h3):", "none");
+            if (preset === null) return;
+            try {
+                const r = await gr.post("/kaggle/start", { model_preset: (preset || "none").trim() });
+                toast("success", "Kaggle-кернел запущен", r.kernel);
+            } catch (e) {
+                toast("error", "Kaggle не запущен",
+                    `${e.message} — проверьте раздел «Подключения и ключи»`, 9000);
+            }
+        };
+        auto.append(this.colabBtn, kaggleBtn);
+        box.appendChild(auto);
+        this.rdStatus = el("div", { class: "gr-muted" });
+        box.appendChild(this.rdStatus);
+
         const ta = el("textarea", { class: "gr-textarea", rows: "3",
-            placeholder: "gpuraid://TOKEN@xxx.trycloudflare.com\n(по строке на воркера — строки печатает ноутбук)" });
+            placeholder: "gpuraid://TOKEN@xxx.trycloudflare.com\n(по строке на воркера — ручной запасной путь)" });
         const btn = el("button", { class: "gr-btn gr-primary" }, "Добавить");
         btn.onclick = async () => {
             try {
@@ -258,6 +419,22 @@ export class GPURaidPanel {
         };
         box.appendChild(ta);
         box.appendChild(btn);
+    }
+
+    renderLifecycle() {
+        if (!this.rdStatus) return;
+        const lc = this.lifecycle || {};
+        const rd = lc.rendezvous || {};
+        if (this.colabBtn && lc.colab_notebook_url) this.colabBtn.href = lc.colab_notebook_url;
+        if (!rd.configured) {
+            this.rdStatus.textContent =
+                "автоподключение не настроено: раздел «Подключения и ключи» → GitHub";
+            return;
+        }
+        const ago = rd.last_poll_ts ? Math.round(Date.now() / 1000 - rd.last_poll_ts) : null;
+        this.rdStatus.textContent = "rendezvous активен" +
+            (ago != null ? ` · gist опрошен ${ago}с назад` : " · жду первого опроса") +
+            (rd.last_error ? ` · ⚠ ${rd.last_error}` : "");
     }
 
     // ------------------------------------------------------------- задания
@@ -319,220 +496,28 @@ export class GPURaidPanel {
         }
     }
 
-    // ------------------------------------------------------------- offload
-
-    renderOffload() {
-        const box = this.elOffload;
-        box.innerHTML = "";
-        const sel = el("select", { class: "gr-select" });
-        for (const w of this.workers) {
-            if (!w.enabled || w.id === "local") continue;
-            const opt = el("option", { value: w.id },
-                esc(`${w.name} (${w.status?.gpu || w.status?.state || "?"})`));
-            sel.appendChild(opt);
-        }
-        if (!sel.children.length) {
-            box.appendChild(el("div", { class: "gr-muted" }, "нет включённых удалённых воркеров"));
-            return;
-        }
-        const label = el("input", { class: "gr-input", placeholder: "имя задания", value: "video" });
-        const btn = el("button", { class: "gr-btn gr-primary" }, "Запустить текущий workflow");
-        btn.onclick = async () => {
-            try {
-                const p = await app.graphToPrompt();
-                const r = await gr.post("/offload", {
-                    graph: p.output, workflow_ui: p.workflow,
-                    worker_id: sel.value, label: label.value, client_id: clientId(),
-                });
-                toast("info", "Offload запущен", (r.warnings || []).join("; "));
-            } catch (e) { toast("error", "Offload не запущен", e.message); }
-        };
-        box.appendChild(sel);
-        box.appendChild(label);
-        box.appendChild(btn);
-        box.appendChild(el("div", { class: "gr-muted" },
-            "Задание уйдёт целиком на выбранный воркер; результаты вернутся в output/gpuraid/…"));
-    }
-
-    // ------------------------------------------------------------- long video
-
-    buildLV() {
-        const box = this.elLV;
-        box.innerHTML = "";
-        const form = el("div", { class: "gr-lvform" });
-        this.lvMode = el("select", { class: "gr-select" });
-        this.lvMode.appendChild(el("option", { value: "chain" }, "chain — продолжение (любая длина)"));
-        this.lvMode.appendChild(el("option", { value: "keyframes" }, "keyframes — параллельно (FLF2V)"));
-        this.lvLabel = el("input", { class: "gr-input", placeholder: "имя проекта", value: "myvideo" });
-        this.lvCount = el("input", { class: "gr-input", type: "number", min: "1", max: "999", value: "4",
-            title: "сегментов (chain)" });
-        this.lvSeed = el("input", { class: "gr-input", type: "number", min: "0", value: "0", title: "seed" });
-        this.lvPolicy = el("select", { class: "gr-select" });
-        for (const p of ["increment", "fixed", "random"]) this.lvPolicy.appendChild(el("option", { value: p }, p));
-        this.lvPrompts = el("textarea", { class: "gr-textarea", rows: "3",
-            placeholder: "промпты сегментов — по строке (пусто = из workflow)" });
-        this.lvKeys = el("textarea", { class: "gr-textarea", rows: "2",
-            placeholder: "keyframes: имена файлов из input, по строке (мин. 2)" });
-        this.lvFade = el("input", { class: "gr-input", type: "number", min: "0", step: "0.1", value: "0",
-            title: "кроссфейд, сек" });
-        const run = el("button", { class: "gr-btn gr-primary" }, "Собрать длинное видео");
-        run.onclick = () => this.startLV();
-
-        form.appendChild(this.row("Режим", this.lvMode));
-        form.appendChild(this.row("Проект", this.lvLabel));
-        form.appendChild(this.row("Сегментов", this.lvCount));
-        form.appendChild(this.row("Seed / политика", this.lvSeed, this.lvPolicy));
-        form.appendChild(this.lvPrompts);
-        form.appendChild(this.lvKeys);
-        form.appendChild(this.row("Кроссфейд, с", this.lvFade, run));
-        form.appendChild(el("div", { class: "gr-muted" },
-            "Шаблон = текущий workflow. Пометьте ноды заголовками GPURAID:START_IMAGE, " +
-            "GPURAID:END_IMAGE (для keyframes), GPURAID:PROMPT, GPURAID:VIDEO_OUT."));
-        box.appendChild(form);
-        this.elProjects = el("div", {});
-        box.appendChild(this.elProjects);
-        this.elEditor = el("div", {});
-        box.appendChild(this.elEditor);
-    }
-
-    row(label, ...controls) {
-        const r = el("div", { class: "gr-row" });
-        r.appendChild(el("span", { class: "gr-label" }, esc(label)));
-        for (const c of controls) r.appendChild(c);
-        return r;
-    }
-
-    async startLV() {
-        try {
-            const p = await app.graphToPrompt();
-            const params = {
-                mode: this.lvMode.value,
-                label: this.lvLabel.value,
-                count: parseInt(this.lvCount.value || "0", 10),
-                seed: parseInt(this.lvSeed.value || "0", 10),
-                seed_policy: this.lvPolicy.value,
-                crossfade_s: parseFloat(this.lvFade.value || "0"),
-                prompts: this.lvPrompts.value.split("\n").filter((x) => x.trim()),
-                keyframes: this.lvKeys.value.split("\n").filter((x) => x.trim()),
-            };
-            const r = await gr.post("/longvideo/start", { graph: p.output, params, client_id: clientId() });
-            toast("success", `Long Video «${r.label}» запущен`);
-        } catch (e) { toast("error", "Long Video не запущен", e.message); }
-    }
+    // ------------------------------------------------------------- проекты
 
     renderProjects() {
-        if (!this.elProjects) return;
         const box = this.elProjects;
-        box.innerHTML = "<div class='gr-subtitle'>Проекты</div>";
-        if (!this.projects.length) { box.appendChild(el("div", { class: "gr-muted" }, "пока нет")); return; }
+        if (!box) return;
+        box.innerHTML = "";
+        box.appendChild(el("div", { class: "gr-muted" },
+            "Раскадровка, промпты и рендер — в нодах «Сценарист» и «Длинное видео» на канве. "
+            + "Здесь только список того, что уже лежит в output/gpuraid/."));
+        if (!this.projects.length) {
+            box.appendChild(el("div", { class: "gr-muted" }, "проектов пока нет"));
+            return;
+        }
         for (const p of this.projects) {
             const row = el("div", { class: "gr-proj" });
-            row.appendChild(el("span", {},
+            row.appendChild(el("span", { class: "gr-grow" },
                 `<b>${esc(p.label)}</b> <span class="gr-muted">${esc(p.mode)} · ${esc(p.state)} · ${p.done}/${p.segments}</span>`));
-            const open = el("button", { class: "gr-btn gr-small" }, "Редактор");
-            open.onclick = () => this.openEditor(p.label);
+            const open = el("button", { class: "gr-btn gr-small gr-primary",
+                title: "привязать проект к ноде на канве и перейти к ней" }, "Открыть на канве");
+            open.onclick = () => openProjectOnCanvas(p.label, p.mode);
             row.appendChild(open);
             box.appendChild(row);
         }
-    }
-
-    async openEditor(label) {
-        try {
-            this.openProject = await gr.get(`/longvideo/${label}`);
-            this.edit = { order: (this.openProject.segments || []).map((s) => s.index),
-                excluded: new Set(), trims: {} };
-            this.renderEditor();
-        } catch (e) { toast("error", "Не открыть проект", e.message); }
-    }
-
-    renderEditor() {
-        const box = this.elEditor;
-        const m = this.openProject;
-        box.innerHTML = "";
-        if (!m) return;
-        box.appendChild(el("div", { class: "gr-subtitle" }, `Редактор: ${esc(m.label)}`));
-        const segMap = new Map((m.segments || []).map((s) => [s.index, s]));
-        const sub = `gpuraid/${m.label}`;
-        for (const idx of this.edit.order) {
-            const s = segMap.get(idx);
-            if (!s) continue;
-            const row = el("div", { class: "gr-seg" + (this.edit.excluded.has(idx) ? " gr-seg-off" : "") });
-            if (s.status === "done") {
-                const v = el("video", { class: "gr-video", controls: "", preload: "metadata",
-                    src: viewURL(s.file, sub, "output", true) });
-                row.appendChild(v);
-            } else {
-                row.appendChild(el("div", { class: "gr-video gr-video-stub" }, esc(s.status)));
-            }
-            const meta = el("div", { class: "gr-seg-meta" });
-            meta.appendChild(el("div", {}, `<b>#${s.index}</b> seed ${esc(String(s.seed ?? ""))} ` +
-                `<span class="gr-muted">${esc(s.worker || "")}</span>` +
-                (s.error ? ` <span class="gr-err">${esc(s.error)}</span>` : "")));
-            if (s.prompt) meta.appendChild(el("div", { class: "gr-muted gr-clip" }, esc(s.prompt)));
-
-            const ctl = el("div", { class: "gr-btns" });
-            const up = el("button", { class: "gr-btn gr-small" }, "↑");
-            up.onclick = () => this.moveSeg(idx, -1);
-            const down = el("button", { class: "gr-btn gr-small" }, "↓");
-            down.onclick = () => this.moveSeg(idx, 1);
-            const onoff = el("button", { class: "gr-btn gr-small" },
-                this.edit.excluded.has(idx) ? "вкл" : "искл");
-            onoff.onclick = () => {
-                this.edit.excluded.has(idx) ? this.edit.excluded.delete(idx) : this.edit.excluded.add(idx);
-                this.renderEditor();
-            };
-            const rer = el("button", { class: "gr-btn gr-small" }, "заново");
-            rer.onclick = async () => {
-                const seed = prompt("Seed (пусто = случайный):", "");
-                try {
-                    await gr.post(`/longvideo/${m.label}/rerender`,
-                        { index: idx, seed: seed ? parseInt(seed, 10) : null });
-                    toast("info", `Сегмент #${idx}: перегенерация запущена`);
-                } catch (e) { toast("error", "Не запущено", e.message); }
-            };
-            ctl.append(up, down, onoff, rer);
-            const tin = el("input", { class: "gr-input gr-tiny", placeholder: "in,c", title: "трим от, сек" });
-            const tout = el("input", { class: "gr-input gr-tiny", placeholder: "out,c", title: "трим до, сек" });
-            const saveTrim = () => {
-                this.edit.trims[idx] = { in_s: parseFloat(tin.value || "0") || 0,
-                    out_s: parseFloat(tout.value || "0") || 0 };
-            };
-            tin.onchange = saveTrim;
-            tout.onchange = saveTrim;
-            ctl.append(tin, tout);
-            meta.appendChild(ctl);
-            row.appendChild(meta);
-            box.appendChild(row);
-        }
-        const fade = el("input", { class: "gr-input gr-tiny", type: "number", min: "0", step: "0.1",
-            value: String(m.crossfade_s || 0), title: "кроссфейд, сек" });
-        const exp = el("button", { class: "gr-btn gr-primary" }, "Экспорт");
-        exp.onclick = async () => {
-            try {
-                const order = this.edit.order.filter((i) => !this.edit.excluded.has(i));
-                await gr.post(`/longvideo/${m.label}/export`, {
-                    order, trims: this.edit.trims, crossfade_s: parseFloat(fade.value || "0"),
-                });
-            } catch (e) { toast("error", "Экспорт не удался", e.message); }
-        };
-        const closeBtn = el("button", { class: "gr-btn" }, "Закрыть");
-        closeBtn.onclick = () => { this.openProject = null; this.renderEditor(); };
-        const bar = el("div", { class: "gr-btns" });
-        bar.append(fade, exp, closeBtn);
-        if (m.final) {
-            const link = el("a", { class: "gr-btn", target: "_blank",
-                href: viewURL(m.final, sub, "output", true) }, "▶ итоговое видео");
-            bar.appendChild(link);
-        }
-        box.appendChild(bar);
-    }
-
-    moveSeg(idx, dir) {
-        const order = this.edit.order;
-        const pos = order.indexOf(idx);
-        const np = pos + dir;
-        if (pos < 0 || np < 0 || np >= order.length) return;
-        [order[pos], order[np]] = [order[np], order[pos]];
-        this.renderEditor();
     }
 }

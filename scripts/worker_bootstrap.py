@@ -51,6 +51,63 @@ def gen_token(token=""):
     return token.strip() or secrets.token_urlsafe(18)
 
 
+def platform_detect():
+    if os.path.isdir("/kaggle"):
+        return "kaggle"
+    if "COLAB_RELEASE_TAG" in os.environ or os.path.isdir("/content"):
+        return "colab"
+    return "generic"
+
+
+def platform_shutdown(platform):
+    """Погасить рантайм платформенно. Для Kaggle-batch достаточно выйти из скрипта."""
+    if platform == "colab":
+        try:
+            from google.colab import runtime
+            print("[shutdown] runtime.unassign() — рантайм Colab освобождается")
+            runtime.unassign()
+        except Exception as e:
+            print(f"[shutdown] runtime.unassign не сработал: {e}")
+
+
+# ---------------------------------------------------------------------------
+# gist-rendezvous: воркер сам сообщает мастеру свой адрес
+# ---------------------------------------------------------------------------
+
+def publish_rendezvous(gh_token, gist_id, session, name, platform, string, state="up"):
+    """PATCH одного файла w_<session>.json в приватном gist (stdlib urllib).
+
+    Файл-на-сессию: конкурирующие воркеры (Colab+Kaggle) не затирают друг
+    друга. Возвращает True/False, никогда не бросает.
+    """
+    if not gh_token or not gist_id:
+        return False
+    payload = {
+        "v": 1, "name": name, "platform": platform, "session": session,
+        "string": string, "ts": int(time.time()), "state": state,
+    }
+    body = json.dumps({"files": {f"w_{session}.json": {
+        "content": json.dumps(payload, ensure_ascii=False)}}}).encode()
+    req = urllib.request.Request(
+        f"https://api.github.com/gists/{gist_id}", data=body, method="PATCH",
+        headers={
+            "Authorization": f"Bearer {gh_token}",
+            "Accept": "application/vnd.github+json",
+            "User-Agent": "comfyui-gpu-raid-worker",
+            "Content-Type": "application/json",
+        },
+    )
+    try:
+        with urllib.request.urlopen(req, timeout=20) as r:
+            ok = 200 <= r.status < 300
+    except Exception as e:
+        print(f"[rendezvous] публикация не удалась: {e}")
+        return False
+    if ok:
+        print(f"[rendezvous] {name}: {state} опубликован в gist")
+    return ok
+
+
 # ---------------------------------------------------------------------------
 # установка
 # ---------------------------------------------------------------------------
@@ -211,11 +268,13 @@ def model_inventory(comfy_dir):
 # запуск ComfyUI
 # ---------------------------------------------------------------------------
 
-def launch_comfy(comfy_dir, port, cuda_device, token, extra_args=(), log_path=None):
+def launch_comfy(comfy_dir, port, cuda_device, token, extra_args=(), log_path=None,
+                 extra_env=None):
     env = dict(os.environ)
     env["GPURAID_TOKEN"] = token
     if cuda_device is not None:
         env["CUDA_VISIBLE_DEVICES"] = str(cuda_device)
+    env.update(extra_env or {})
     cmd = [sys.executable, os.path.join(comfy_dir, "main.py"),
            "--listen", "127.0.0.1", "--port", str(port), *extra_args]
     log = open(log_path or f"/tmp/comfy_{port}.log", "ab")
@@ -335,10 +394,13 @@ def connection_string(token, url, name):
 
 def bring_up(gpuraid_src, comfy_dir, token, gpus=(0,), base_port=8188,
              extra_args=(), use_datasets=True, hf_preset="none", hf_token=None,
-             name_prefix="worker", drive_cache_dir=None):
-    """Полный цикл: установка -> модели -> запуск N инстансов -> auth -> туннели.
+             name_prefix="worker", drive_cache_dir=None,
+             gist_id="", gh_token="", max_session_min=0):
+    """Полный цикл: установка -> модели -> запуск N инстансов -> auth -> туннели
+    -> публикация в gist (если задан).
 
-    Возвращает {"strings": [...], "procs": [...], "urls": [...]}.
+    Возвращает info для watchdog(): {"strings", "procs", "urls", "instances",
+    "platform", "shutdown_file", ...}. Старые ключи сохранены для keepalive().
     """
     if hf_preset == "minimax_h3":
         # ~35-40 ГБ весов при 32 ГБ RAM без свопа (Kaggle/Colab): держать их в RAM
@@ -357,12 +419,28 @@ def bring_up(gpuraid_src, comfy_dir, token, gpus=(0,), base_port=8188,
     if shutil.which("ffmpeg") is None:
         print("! ffmpeg не найден — VHS_VideoCombine может не работать")
 
-    procs, urls, strings = [], [], []
+    platform = platform_detect()
+    session_base = secrets.token_hex(4)
+    shutdown_file = f"/tmp/gpuraid_shutdown_{session_base}"
+
+    procs, urls, strings, instances = [], [], [], []
     for i, gpu in enumerate(gpus):
         port = base_port + i
-        procs.append(launch_comfy(comfy_dir, port, gpu, token, extra_args))
-    for i, gpu in enumerate(gpus):
-        port = base_port + i
+        session = f"{session_base}{i}" if len(gpus) > 1 else session_base
+        proc = launch_comfy(comfy_dir, port, gpu, token, extra_args, extra_env={
+            "GPURAID_SHUTDOWN_FILE": shutdown_file,
+            "GPURAID_PLATFORM": platform,
+            "GPURAID_SESSION": session,
+        })
+        procs.append(proc)
+        instances.append({
+            "index": i, "gpu": gpu, "port": port, "session": session,
+            "name": f"{name_prefix}-{i}", "comfy_proc": proc,
+            "tunnel_proc": None, "tunnel_port": port, "url": "", "string": "",
+            "restarted": False,
+        })
+    for inst in instances:
+        port = inst["port"]
         wait_ready(port)
         tunnel_port = port
         if auth_selftest(port, token):
@@ -373,21 +451,34 @@ def bring_up(gpuraid_src, comfy_dir, token, gpus=(0,), base_port=8188,
             procs.append(start_authproxy(gpuraid_src, tunnel_port, port, token))
         proc, url = start_cloudflared(tunnel_port)
         procs.append(proc)
+        inst.update(tunnel_proc=proc, tunnel_port=tunnel_port, url=url,
+                    string=connection_string(token, url, inst["name"]))
         urls.append(url)
-        strings.append(connection_string(token, url, f"{name_prefix}-{i}"))
+        strings.append(inst["string"])
+        publish_rendezvous(gh_token, gist_id, inst["session"], inst["name"],
+                           platform, inst["string"])
 
     print("\n" + "=" * 72)
-    print("СКОПИРУЙТЕ СТРОКИ В ПАНЕЛЬ GPU RAID (Добавить воркеров):")
+    if gist_id and gh_token:
+        print("АДРЕСА ОПУБЛИКОВАНЫ В GIST — мастер подхватит воркеров сам.")
+        print("Строки ниже — запасной вариант для ручного добавления:")
+    else:
+        print("СКОПИРУЙТЕ СТРОКИ В ПАНЕЛЬ GPU RAID (Добавить воркеров):")
     for s in strings:
         print("   " + s)
     print("=" * 72)
-    print("Держите вкладку открытой. Если туннель умер — перезапустите ячейку")
-    print("туннеля и обновите URL воркера кнопкой «URL» в панели (токен сохранится).")
-    return {"strings": strings, "procs": procs, "urls": urls}
+    return {
+        "strings": strings, "procs": procs, "urls": urls,
+        "instances": instances, "platform": platform, "token": token,
+        "gist_id": gist_id, "gh_token": gh_token,
+        "shutdown_file": shutdown_file, "max_session_min": float(max_session_min or 0),
+        "comfy_dir": comfy_dir, "gpuraid_src": gpuraid_src,
+        "extra_args": tuple(extra_args), "t0": time.time(),
+    }
 
 
 def keepalive(procs, log_paths=(), interval=60):
-    """Бесконечный цикл: держит сессию живой и следит за процессами."""
+    """Старый цикл (совместимость): держит сессию и печатает хвосты логов."""
     try:
         while True:
             dead = [p.pid for p in procs if p.poll() is not None]
@@ -405,3 +496,92 @@ def keepalive(procs, log_paths=(), interval=60):
             time.sleep(interval)
     except KeyboardInterrupt:
         print("stop")
+
+
+def _kill(proc):
+    if proc is None or proc.poll() is not None:
+        return
+    try:
+        proc.terminate()
+        try:
+            proc.wait(timeout=10)
+        except subprocess.TimeoutExpired:
+            proc.kill()
+    except Exception:
+        pass
+
+
+def watchdog(info, interval=15, republish_s=240):
+    """Умный keepalive: следит за процессами, туннелями, sentinel'ом и бюджетом.
+
+    Выходит (и платформенно гасит рантайм), когда:
+      * мастер прислал POST /gpuraid/worker/shutdown (расширение на воркере
+        пишет sentinel-файл GPURAID_SHUTDOWN_FILE);
+      * превышен max_session_min (самостраховка на случай смерти мастера).
+    Умерший cloudflared перезапускается, новый URL перепубликуется в gist;
+    умерший ComfyUI перезапускается один раз.
+    """
+    reason = ""
+    last_publish = time.time()
+    try:
+        while True:
+            if os.path.isfile(info["shutdown_file"]):
+                reason = "команда мастера"
+                break
+            budget = info.get("max_session_min") or 0
+            age_min = (time.time() - info["t0"]) / 60.0
+            if budget and age_min >= budget:
+                reason = f"самостраховка: {int(age_min)} мин ≥ {int(budget)} мин"
+                break
+
+            for inst in info["instances"]:
+                # ComfyUI умер — одна попытка поднять заново
+                if inst["comfy_proc"].poll() is not None:
+                    if inst.get("restarted"):
+                        print(f"[watchdog] comfy :{inst['port']} умер повторно — "
+                              "смотрите /tmp/comfy_*.log")
+                    else:
+                        print(f"[watchdog] comfy :{inst['port']} умер — перезапускаю")
+                        inst["restarted"] = True
+                        inst["comfy_proc"] = launch_comfy(
+                            info["comfy_dir"], inst["port"], inst["gpu"], info["token"],
+                            info["extra_args"], extra_env={
+                                "GPURAID_SHUTDOWN_FILE": info["shutdown_file"],
+                                "GPURAID_PLATFORM": info["platform"],
+                                "GPURAID_SESSION": inst["session"],
+                            })
+                        try:
+                            wait_ready(inst["port"])
+                        except RuntimeError as e:
+                            print(f"[watchdog] {e}")
+                # туннель умер — перезапуск + перепубликация нового URL
+                if inst["tunnel_proc"] is not None and inst["tunnel_proc"].poll() is not None:
+                    print(f"[watchdog] туннель :{inst['tunnel_port']} умер — перезапускаю")
+                    try:
+                        proc, url = start_cloudflared(inst["tunnel_port"])
+                    except RuntimeError as e:
+                        print(f"[watchdog] {e}")
+                        continue
+                    inst.update(tunnel_proc=proc, url=url,
+                                string=connection_string(info["token"], url, inst["name"]))
+                    publish_rendezvous(info["gh_token"], info["gist_id"], inst["session"],
+                                       inst["name"], info["platform"], inst["string"])
+                    last_publish = time.time()
+
+            # периодическая перепубликация = heartbeat для rendezvous (TTL 10 мин)
+            if time.time() - last_publish >= republish_s:
+                for inst in info["instances"]:
+                    publish_rendezvous(info["gh_token"], info["gist_id"], inst["session"],
+                                       inst["name"], info["platform"], inst["string"])
+                last_publish = time.time()
+            time.sleep(interval)
+    except KeyboardInterrupt:
+        reason = "остановлено вручную"
+    print(f"[watchdog] завершение: {reason}")
+    for inst in info["instances"]:
+        publish_rendezvous(info["gh_token"], info["gist_id"], inst["session"],
+                           inst["name"], info["platform"], inst["string"], state="down")
+    for proc in info["procs"]:
+        _kill(proc)
+    platform_shutdown(info["platform"])
+    return reason

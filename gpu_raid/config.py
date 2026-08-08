@@ -61,8 +61,10 @@ def save_json_atomic(path, data):
 def merged_settings(stored):
     out = json.loads(json.dumps(DEFAULT_SETTINGS))
     for key, value in (stored or {}).items():
-        if key == "timeouts" and isinstance(value, dict):
-            out["timeouts"].update(value)
+        # вложенные блоки (timeouts/lifecycle/llm/rendezvous) сливаем поверх
+        # дефолтов, чтобы частично сохранённый блок не терял остальные ключи
+        if isinstance(value, dict) and isinstance(out.get(key), dict):
+            out[key].update(value)
         else:
             out[key] = value
     return out

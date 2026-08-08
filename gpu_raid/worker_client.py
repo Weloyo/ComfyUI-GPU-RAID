@@ -221,6 +221,16 @@ class WorkerClient:
 
     # ---------------- /gpuraid/* воркера ----------------
 
+    async def shutdown(self):
+        """POST /gpuraid/worker/shutdown — просьба воркеру погасить себя.
+
+        Возвращает {"ok": bool, ...}; сетевые ошибки пробрасываются наверх.
+        """
+        status, body = await self.post_json("/gpuraid/worker/shutdown", {}, timeout=15)
+        if status == 200:
+            return body or {"ok": True}
+        return {"ok": False, "reason": (body or {}).get("reason", f"HTTP {status}")}
+
     async def download_model(self, payload):
         status, body = await self.post_json("/gpuraid/download_model", payload, timeout=30)
         if status != 200:

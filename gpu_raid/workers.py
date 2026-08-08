@@ -111,8 +111,12 @@ class WorkerRegistry:
         data = self._ensure_loaded()
         stored = data.setdefault("settings", {})
         for key, value in (patch or {}).items():
-            if key == "timeouts" and isinstance(value, dict):
-                stored.setdefault("timeouts", {}).update(value)
+            if isinstance(value, dict):
+                merged = stored.setdefault(key, {})
+                if isinstance(merged, dict):
+                    merged.update(value)
+                else:
+                    stored[key] = dict(value)
             else:
                 stored[key] = value
         await self._save()
@@ -160,6 +164,7 @@ class WorkerRegistry:
                 "url": parsed["url"],
                 "token": parsed["token"],
                 "enabled": True,
+                "pinned": False,
                 "kind": "lan" if _is_private_host(urlsplit(parsed["url"]).hostname or "") else "cloud",
                 "model_remap": {},
                 "added_at": int(time.time()),
@@ -180,9 +185,12 @@ class WorkerRegistry:
         w = self.get(worker_id)
         if w is None:
             return None
-        for key in ("name", "url", "token", "enabled", "notes", "kind"):
+        for key in ("name", "url", "token", "enabled", "notes", "kind",
+                    "session", "platform"):
             if key in patch:
                 w[key] = patch[key]
+        if "pinned" in patch:
+            w["pinned"] = bool(patch["pinned"])
         if "model_remap" in patch and isinstance(patch["model_remap"], dict):
             w["model_remap"] = patch["model_remap"]
         if "add_remap" in patch:
@@ -233,9 +241,12 @@ class WorkerRegistry:
 
     async def probe_worker(self, record, full=False):
         wc = self.client(record)
+        prev = self.status.get(record["id"], {})
         probe = await wc.probe(timeout=self.settings()["timeouts"]["probe_s"])
         if not probe.get("ok"):
-            self.set_status(record["id"], state="offline", error=probe.get("error", ""))
+            # остановленный нами воркер недостижим — это норма, не «offline»
+            state = "stopped" if prev.get("state") == "stopped" else "offline"
+            self.set_status(record["id"], state=state, error=probe.get("error", ""))
             return False
         fields = {
             "state": "online",
@@ -244,7 +255,9 @@ class WorkerRegistry:
             "error": "",
             "last_seen": time.time(),
         }
-        if full or "gpu" not in self.status.get(record["id"], {}):
+        if prev.get("state") != "online" or not prev.get("online_since"):
+            fields["online_since"] = time.time()
+        if full or "gpu" not in prev:
             try:
                 stats = await wc.system_stats()
                 dev = (stats.get("devices") or [{}])[0]
@@ -256,6 +269,10 @@ class WorkerRegistry:
                 info = await wc.info()
                 if info:
                     fields["ext_version"] = info.get("version")
+                    if info.get("started_ts"):
+                        fields["worker_started_ts"] = info["started_ts"]
+                    if info.get("platform"):
+                        fields["platform"] = info["platform"]
             except Exception as e:
                 log.debug("system_stats failed for %s: %s", record["id"], e)
         self.set_status(record["id"], **fields)
@@ -267,10 +284,16 @@ class WorkerRegistry:
             try:
                 interval = float(self.settings().get("heartbeat_s", 15))
                 for record in self.enabled_records():
+                    # остановленных пробим редко (мёртвый туннель = долгие таймауты),
+                    # но не забываем: воркер могли поднять заново вручную
+                    st = self.status.get(record["id"], {})
+                    if st.get("state") == "stopped" and tick % 10 != 0:
+                        continue
                     try:
                         await self.probe_worker(record, full=(tick % 4 == 0))
                     except Exception as e:
-                        self.set_status(record["id"], state="offline", error=str(e))
+                        state = "stopped" if st.get("state") == "stopped" else "offline"
+                        self.set_status(record["id"], state=state, error=str(e))
                 tick += 1
             except Exception:
                 log.exception("heartbeat loop error")

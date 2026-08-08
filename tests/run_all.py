@@ -12,10 +12,17 @@ _TESTS = os.path.dirname(os.path.abspath(__file__))
 sys.path.insert(0, _TESTS)
 sys.path.insert(0, os.path.dirname(_TESTS))
 
+import test_bundle  # noqa: E402
 import test_graph_rewrite  # noqa: E402
+import test_lifecycle_rules  # noqa: E402
 import test_parity  # noqa: E402
+import test_pipeline_split  # noqa: E402
+import test_providers  # noqa: E402
+import test_rendezvous  # noqa: E402
+import test_storyplan  # noqa: E402
 
-MODULES = [test_graph_rewrite, test_parity]
+MODULES = [test_bundle, test_graph_rewrite, test_lifecycle_rules, test_parity,
+           test_pipeline_split, test_providers, test_rendezvous, test_storyplan]
 
 
 def main():

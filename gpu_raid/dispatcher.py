@@ -215,6 +215,7 @@ class JobManager:
         self.history = []
         self.hubs = {}
         self.reserved = set()
+        self.worker_last_active = {}  # worker_id -> epoch последнего юнита (для lifecycle)
 
     # ------------------------------------------------------------------ utils
 
@@ -243,9 +244,13 @@ class JobManager:
 
     async def _eligible_workers(self, job, only_worker_id=None, need_probe=True):
         records = []
+        policy = (REGISTRY.settings().get("lifecycle") or {}).get("policy")
         for record in REGISTRY.enabled_records():
             wid = record["id"]
             if only_worker_id and wid != only_worker_id:
+                continue
+            if policy == "local_only" and record.get("kind") == "cloud":
+                job.excluded.append({"id": wid, "reason": "режим «Только локально»"})
                 continue
             if wid in self.reserved and wid != only_worker_id:
                 job.excluded.append({"id": wid, "reason": "занят offload-задачей"})
@@ -490,6 +495,12 @@ class JobManager:
         events.send("job_done", summary)
         if job.kind == "stripe":
             results.gc_jobs(REGISTRY.settings().get("keep_last_jobs", 5))
+        if REGISTRY.settings().get("free_after_job"):
+            # гигиена VRAM: выгрузить модели на удалённых воркерах после job'а
+            for wid in job.stats.get("per_worker", {}):
+                record = REGISTRY.get(wid)
+                if record is not None and wid != "local":
+                    self.loop.create_task(REGISTRY.client(record).free())
 
     def _emit_unit(self, job, unit, throttle=False):
         payload = {"job_id": job.job_id, **unit.snapshot()}
@@ -514,8 +525,10 @@ class JobManager:
                 if job.done_event.is_set():
                     break
                 continue
-            unit = job.units[index]
-            if unit.state in (DONE, DEAD):
+            # поиск по unit.index: список юнитов может быть подмножеством
+            # (например, рендер выбранных кадров Сценариста)
+            unit = next((u for u in job.units if u.index == index), None)
+            if unit is None or unit.state in (DONE, DEAD):
                 continue
 
             now = time.monotonic()
@@ -648,6 +661,7 @@ class JobManager:
         finally:
             job.inflight.pop(unit.index, None)
             hub.untrack(pid)
+            self.worker_last_active[wid] = time.time()
 
         unit.state = FETCHING
         self._emit_unit(job, unit)
@@ -658,6 +672,10 @@ class JobManager:
                 await self._fetch_upscale(job, wc, unit, hist)
             elif fetch == "longvideo":
                 await self._fetch_longvideo(job, wc, unit, hist)
+            elif fetch == "storykf":
+                await self._fetch_storykf(job, wc, unit, hist)
+            elif fetch == "pipeline":
+                await self._fetch_pipeline(job, wc, unit, hist)
             else:
                 await self._fetch_stripe(job, wc, unit, hist)
         except UnitFailure:
@@ -668,6 +686,13 @@ class JobManager:
         unit.state = DONE
         unit.t_done = time.monotonic()
         self._emit_unit(job, unit)
+        # хук живых обновлений (Сценарист пишет манифест по мере готовности юнитов)
+        cb = getattr(job, "on_unit_done", None)
+        if cb is not None:
+            try:
+                cb(job, unit)
+            except Exception:
+                log.exception("on_unit_done hook failed")
 
     async def _monitor(self, job, wc, unit, hub, pid):
         tp = hub.track(pid)
@@ -823,6 +848,47 @@ class JobManager:
                               worker_fault=False)
         dest = unit.meta["out_file"]
         await wc.download_view(ref, dest)
+        unit.files = [dest]
+
+    async def _fetch_pipeline(self, job, wc, unit, hist):
+        """Стадия конвейера: бандлы -> input мастера (под логическими именами,
+        их подхватит upload-механизм следующих стадий); остальные output-файлы
+        (финальная стадия) -> deliver-каталог job'а."""
+        outputs = (hist or {}).get("outputs", {})
+        unit.files = []
+        out_map = unit.meta.get("out_bundles") or {}
+        input_base = folder_paths.get_input_directory()
+        for sb_id, logical in out_map.items():
+            refs = ((outputs.get(sb_id) or {}).get("gpuraid_bundles")) or []
+            if not refs:
+                raise UnitFailure(f"стадия не вернула бандл {logical}", worker_fault=True)
+            dest = os.path.join(input_base, *logical.split("/"))
+            await wc.download_view(refs[0], dest)
+            unit.files.append(dest)
+        for node_id, node_out in outputs.items():
+            if node_id in out_map or not isinstance(node_out, dict):
+                continue
+            for items in node_out.values():
+                if not isinstance(items, list):
+                    continue
+                for ref in items:
+                    if not (isinstance(ref, dict) and ref.get("filename")):
+                        continue
+                    if ref.get("type") not in (None, "output"):
+                        continue
+                    dest = os.path.join(job.outdir, ref["filename"])
+                    await wc.download_view(ref, dest)
+                    unit.files.append(dest)
+
+    async def _fetch_storykf(self, job, wc, unit, hist):
+        """Ключевой кадр Сценариста: одно изображение -> input/gpuraid_story/<label>/."""
+        outputs = (hist or {}).get("outputs", {})
+        images = (outputs.get(SAVE_NODE_ID) or {}).get("images") or []
+        images = [f for f in images if f.get("type") == "output"]
+        if not images:
+            raise UnitFailure("кадр без результата (outputs пуст)", worker_fault=True)
+        dest = unit.meta["out_file"]
+        await wc.download_view(images[0], dest)
         unit.files = [dest]
 
     async def _fetch_upscale(self, job, wc, unit, hist):

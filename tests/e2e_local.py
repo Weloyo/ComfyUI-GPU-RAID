@@ -11,8 +11,10 @@ COMPLETE 4/4, исполнение хвоста и 401 без токена. Ва
 
 import json
 import os
+import shutil
 import subprocess
 import sys
+import tempfile
 import time
 import urllib.error
 import urllib.request
@@ -49,15 +51,17 @@ def wait_ready(base, headers=None, timeout=420):
     raise SystemExit(f"{base} не поднялся за {timeout}с")
 
 
-def spawn(port, env_extra):
+def spawn(port, env_extra, user_dir):
+    """user_dir изолирует workers.json от боевого инстанса (в обе стороны)."""
     env = dict(os.environ)
     env.pop("GPURAID_TOKEN", None)
     env.pop("GPURAID_AUTH_STRICT", None)
     env.update(env_extra)
+    os.makedirs(user_dir, exist_ok=True)
     log = open(os.path.join(os.path.dirname(__file__), f"e2e_{port}.log"), "wb")
     return subprocess.Popen(
         [PY, "-s", MAIN, "--windows-standalone-build", "--port", str(port),
-         "--listen", "127.0.0.1", "--cpu"],
+         "--listen", "127.0.0.1", "--cpu", "--user-directory", user_dir],
         cwd=COMFY, env=env, stdout=log, stderr=subprocess.STDOUT,
     )
 
@@ -76,10 +80,14 @@ STRIPE_GRAPH = {
 def main():
     procs = []
     wid = None
+    users_tmp = tempfile.mkdtemp(prefix="gpuraid_e2e_users_")
     try:
         print("[1] запускаю мастера :8189 и воркера :8190 (CPU)…")
-        procs.append(spawn(8189, {}))
-        procs.append(spawn(8190, {"GPURAID_TOKEN": TOKEN, "GPURAID_AUTH_STRICT": "1"}))
+        sentinel = os.path.join(users_tmp, "shutdown_sentinel")
+        procs.append(spawn(8189, {}, os.path.join(users_tmp, "master")))
+        procs.append(spawn(8190, {"GPURAID_TOKEN": TOKEN, "GPURAID_AUTH_STRICT": "1",
+                                  "GPURAID_SHUTDOWN_FILE": sentinel},
+                           os.path.join(users_tmp, "worker")))
         wait_ready(A)
         wait_ready(B, headers={"X-GPURAID-Token": TOKEN})
 
@@ -145,7 +153,29 @@ def main():
         print(f"  файлы хвоста: {sorted(set(tail_files))[:5]} (всего {len(tail_files)})")
         assert len(set(tail_files)) >= 4, "в батче хвоста меньше 4 изображений"
 
-        print("\nE2E OK — страйпинг, auth, сборка и хвост работают.")
+        print("[7] настройки и секреты…")
+        _, s = req("GET", A + "/gpuraid/settings")
+        assert s["settings"]["lifecycle"]["policy"] in ("keep", "eco", "instant", "local_only"), s
+        _, s = req("PATCH", A + "/gpuraid/settings",
+                   {"lifecycle": {"policy": "keep"}, "llm": {"base_url": "http://x/v1"}})
+        assert s["settings"]["lifecycle"]["policy"] == "keep", s
+        assert s["settings"]["lifecycle"]["idle_stop_min"] == 10, "частичный patch потерял дефолты"
+        assert s["settings"]["llm"]["base_url"] == "http://x/v1", s
+        _, s = req("POST", A + "/gpuraid/secrets", {"llm_api_key": "sk-e2e-secret"})
+        assert s["secrets"]["has_llm_key"] is True, s
+        _, s = req("GET", A + "/gpuraid/settings")
+        assert "sk-e2e-secret" not in json.dumps(s), "секрет утёк в GET /settings"
+        assert s["secrets"]["has_llm_key"] is True, s
+        print("  settings roundtrip ok, секрет не утёк")
+
+        print("[8] канал остановки воркера (sentinel)…")
+        status, r = req("POST", B + "/gpuraid/worker/shutdown", {},
+                        headers={"X-GPURAID-Token": TOKEN})
+        assert status == 200 and r.get("ok"), r
+        assert os.path.isfile(sentinel), "sentinel-файл не появился"
+        print("  sentinel записан")
+
+        print("\nE2E OK — страйпинг, auth, сборка, хвост, настройки и shutdown работают.")
         return 0
     finally:
         if wid:
@@ -158,6 +188,8 @@ def main():
                 p.terminate()
             except Exception:
                 pass
+        time.sleep(2)
+        shutil.rmtree(users_tmp, ignore_errors=True)
 
 
 if __name__ == "__main__":
