@@ -21,6 +21,7 @@
     opacity: 0.8; }
 
 .gr-worker { border-bottom: 1px dashed var(--border-color, #444); padding: 4px 0; }
+.gr-worker-off { opacity: 0.5; }
 .gr-worker-head { display: flex; align-items: center; gap: 6px; }
 .gr-name { font-weight: 600; white-space: nowrap; }
 

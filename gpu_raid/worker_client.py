@@ -36,10 +36,32 @@ class WorkerClient:
     def _headers(self):
         return {TOKEN_HEADER: self.token} if self.token else {}
 
+    def _is_local_host(self):
+        """Воркер в локальной сети? Тогда keep-alive безопасен и полезен."""
+        import ipaddress
+        from urllib.parse import urlsplit
+
+        host = (urlsplit(self.url).hostname or "").lower()
+        if host in ("localhost", "127.0.0.1", "::1"):
+            return True
+        try:
+            addr = ipaddress.ip_address(host)
+        except ValueError:
+            return False        # доменное имя = почти всегда туннель
+        return addr.is_loopback or addr.is_private
+
     async def session(self):
         if self._session is None or self._session.closed:
+            # Через бесплатный cloudflared-туннель переиспользование keep-alive
+            # ломается: первый запрос по соединению проходит, второй висит до
+            # таймаута (проверено: /prompt 0.5с, следом /system_stats — 15с в
+            # TimeoutError; с force_close оба по 0.5с). Молчаливые зависания
+            # выглядели бы как «воркер тупит», поэтому для туннелей соединение
+            # не переиспользуем — лишний TLS-хендшейк дешевле потерянных минут.
+            connector = aiohttp.TCPConnector(
+                force_close=not self._is_local_host(), enable_cleanup_closed=True)
             self._session = aiohttp.ClientSession(
-                headers=self._headers(),
+                headers=self._headers(), connector=connector,
                 timeout=aiohttp.ClientTimeout(total=None, connect=15, sock_read=120),
             )
         return self._session

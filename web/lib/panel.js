@@ -232,11 +232,18 @@ export class GPURaidPanel {
         if (!this.workers.length) box.appendChild(el("div", { class: "gr-muted" }, "нет данных"));
         for (const w of this.workers) {
             const st = w.status || {};
-            const row = el("div", { class: "gr-worker" });
+            const row = el("div", { class: "gr-worker" + (w.enabled ? "" : " gr-worker-off") });
             const head = el("div", { class: "gr-worker-head" });
-            head.appendChild(el("span", { class: `gr-dot ${stateDot(st.state)}`,
-                title: st.state === "stopped" ? "остановлен (lifecycle)" : (st.state || "") }));
+            // выключенный воркер не получает заданий — точка про доступность
+            // тут только вводила бы в заблуждение
+            head.appendChild(el("span", {
+                class: `gr-dot ${w.enabled ? stateDot(st.state) : "gr-dot-gray"}`,
+                title: w.enabled
+                    ? (st.state === "stopped" ? "остановлен (lifecycle)" : (st.state || ""))
+                    : "выключен: задания не получает",
+            }));
             head.appendChild(el("span", { class: "gr-name", title: w.url }, esc(w.name)));
+            if (!w.enabled) head.appendChild(el("span", { class: "gr-badge" }, "выкл"));
             const badge = platformBadge(w.platform || st.platform ||
                 (w.kind === "cloud" ? "generic" : ""));
             if (badge) head.appendChild(el("span", { class: "gr-badge" }, esc(badge)));

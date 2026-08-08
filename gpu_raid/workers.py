@@ -274,7 +274,10 @@ class WorkerRegistry:
                     if info.get("platform"):
                         fields["platform"] = info["platform"]
             except Exception as e:
-                log.debug("system_stats failed for %s: %s", record["id"], e)
+                # молча потерянные gpu/vram — это невидимая деградация: воркер
+                # выглядит живым, но раскладка и min_vram_gb работают вслепую
+                log.warning("GPU RAID: полный опрос воркера %s не удался: %s: %s",
+                            record["id"], type(e).__name__, e)
         self.set_status(record["id"], **fields)
         return True
 

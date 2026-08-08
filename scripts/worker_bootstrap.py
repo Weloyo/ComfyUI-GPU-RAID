@@ -52,10 +52,22 @@ def gen_token(token=""):
 
 
 def platform_detect():
+    """Где мы работаем: colab | kaggle | generic.
+
+    Порядок важен. Сначала переменные окружения — они однозначны. Каталог
+    /kaggle есть и в образе Colab, поэтому проверка по файловой системе, если
+    до неё дошло, тоже начинается с Colab: ошибка здесь стоила бы автостопа
+    (platform_shutdown зовёт runtime.unassign только для colab, и рантайм
+    Colab продолжал бы жечь квоту после остановки воркера).
+    """
+    if "COLAB_RELEASE_TAG" in os.environ or "COLAB_GPU" in os.environ:
+        return "colab"
+    if os.environ.get("KAGGLE_KERNEL_RUN_TYPE") or os.environ.get("KAGGLE_URL_BASE"):
+        return "kaggle"
+    if os.path.isdir("/content"):
+        return "colab"
     if os.path.isdir("/kaggle"):
         return "kaggle"
-    if "COLAB_RELEASE_TAG" in os.environ or os.path.isdir("/content"):
-        return "colab"
     return "generic"
 
 
