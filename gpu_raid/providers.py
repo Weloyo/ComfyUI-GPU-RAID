@@ -235,10 +235,12 @@ def status_view(settings, secrets_view):
     return {"providers": out, "extra": extra}
 
 
-async def _remember(pid, ok, detail):
+async def _remember(pid, ok, detail, pending=""):
+    """pending — id действия, которого не хватает до готовности (не ошибка!)."""
     from .workers import REGISTRY
 
-    result = {"ok": bool(ok), "detail": str(detail or ""), "ts": int(time.time())}
+    result = {"ok": bool(ok), "detail": str(detail or ""), "ts": int(time.time()),
+              "pending": str(pending or "")}
     current = dict((REGISTRY.settings().get("connections") or {}))
     current[pid] = result
     await REGISTRY.update_settings({"connections": current})
@@ -349,7 +351,10 @@ async def check(pid):
             detail = f"сервис не ответил за {HTTP_TIMEOUT_S} с — проверьте сеть или прокси"
         else:
             detail = str(e).strip() or type(e).__name__
-    stored = await _remember(pid, ok, detail)
+    # «ключ верный, но остался шаг» — это не провал: помечаем pending, чтобы UI
+    # не пугал красным там, где надо просто нажать соседнюю кнопку
+    pending = extra.pop("pending", "") if isinstance(extra, dict) else ""
+    stored = await _remember(pid, ok, detail, pending)
     # extra (например, список моделей) живёт только в ответе: settings хранит
     # компактный результат, иначе мутация сохранённого объекта утечёт на диск
     return {**stored, "extra": extra}
@@ -414,23 +419,42 @@ async def _check_github():
             login = (await r.json()).get("login") or "?"
         gist_id = str((REGISTRY.settings().get("rendezvous") or {}).get("gist_id") or "")
         if not gist_id:
-            return False, f"аккаунт {login}, но gist не создан", {"login": login}
+            return (False, f"токен работает (аккаунт {login}) — остался один шаг: "
+                    "нажмите «Создать приватный gist»",
+                    {"login": login, "pending": "create_gist"})
         async with s.get(f"https://api.github.com/gists/{gist_id}",
                          headers=headers) as r:
             if r.status == 404:
-                return False, f"аккаунт {login}: gist {gist_id} не найден", {"login": login}
+                return (False, f"аккаунт {login}: gist {gist_id} не найден — "
+                        "создайте новый кнопкой ниже",
+                        {"login": login, "pending": "create_gist"})
             if r.status != 200:
                 return False, f"аккаунт {login}: gist HTTP {r.status}", {"login": login}
     return True, f"аккаунт {login} · gist {gist_id}", {"login": login}
 
 
 async def create_gist():
-    """Создаёт приватный gist под rendezvous и сразу прописывает его id."""
+    """Создаёт приватный gist под rendezvous и сразу прописывает его id.
+
+    Идемпотентна: если рабочий gist уже прописан — возвращает его, а не плодит
+    пустые гисты в аккаунте на каждое нажатие кнопки.
+    """
     from .workers import REGISTRY
 
     headers = await _github_headers()
     if not headers:
         raise RuntimeError("сначала сохраните GitHub-токен")
+
+    current = str((REGISTRY.settings().get("rendezvous") or {}).get("gist_id") or "")
+    if current:
+        async with _session() as s:
+            async with s.get(f"https://api.github.com/gists/{current}",
+                             headers=headers) as r:
+                if r.status == 200:
+                    data = await r.json()
+                    return {"gist_id": current, "reused": True,
+                            "html_url": data.get("html_url", "")}
+
     body = {
         "description": "ComfyUI GPU RAID — rendezvous (воркеры публикуют сюда адреса)",
         "public": False,
@@ -470,8 +494,11 @@ async def _check_kaggle():
             if r.status != 200:
                 return False, f"HTTP {r.status}", {}
     cli = kaggle_cli_present()
-    detail = f"аккаунт {user}" + ("" if cli else " · нет kaggle CLI (кнопка ниже)")
-    return cli, detail, {"username": user, "cli": cli}
+    if not cli:
+        return (False, f"ключ работает (аккаунт {user}) — остался один шаг: "
+                "нажмите «Установить kaggle CLI»",
+                {"username": user, "cli": False, "pending": "install_cli"})
+    return True, f"аккаунт {user}", {"username": user, "cli": True}
 
 
 async def install_kaggle_cli():

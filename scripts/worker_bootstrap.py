@@ -268,6 +268,30 @@ def model_inventory(comfy_dir):
 # запуск ComfyUI
 # ---------------------------------------------------------------------------
 
+def scratch_args(platform):
+    """Каталоги ввода/вывода воркера — ВНЕ хранилища платформы.
+
+    На Kaggle `/kaggle/working` персистентен: всё, что туда попало, платформа
+    сохраняет как «вывод ноутбука» и прогоняет через автоматическую модерацию
+    контента. Воркеру хранить там нечего — результаты он отдаёт мастеру по HTTP,
+    а кадры/промежуточные файлы чисто транзитные. Уводим их в эфемерный /kaggle/tmp
+    (на Colab — в /content/gpuraid_scratch), в рабочем каталоге остаётся только код.
+    """
+    base = {"kaggle": "/kaggle/tmp/gpuraid_scratch",
+            "colab": "/content/gpuraid_scratch"}.get(platform)
+    if not base:
+        return ()
+    args = []
+    for flag, sub in (("--output-directory", "output"),
+                      ("--temp-directory", "temp"),
+                      ("--input-directory", "input")):
+        path = f"{base}/{sub}"          # воркер всегда Linux — не os.path.join
+        os.makedirs(path, exist_ok=True)
+        args += [flag, path]
+    print(f"[scratch] ввод/вывод воркера вне хранилища платформы: {base}")
+    return tuple(args)
+
+
 def launch_comfy(comfy_dir, port, cuda_device, token, extra_args=(), log_path=None,
                  extra_env=None):
     env = dict(os.environ)
@@ -420,6 +444,7 @@ def bring_up(gpuraid_src, comfy_dir, token, gpus=(0,), base_port=8188,
         print("! ffmpeg не найден — VHS_VideoCombine может не работать")
 
     platform = platform_detect()
+    extra_args = tuple(extra_args) + scratch_args(platform)
     session_base = secrets.token_hex(4)
     shutdown_file = f"/tmp/gpuraid_shutdown_{session_base}"
 

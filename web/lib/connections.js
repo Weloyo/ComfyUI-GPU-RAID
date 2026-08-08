@@ -61,7 +61,10 @@ export class ConnectionsUI {
 
     card(p) {
         const checked = p.check || {};
-        const level = checked.ok ? "green" : (p.configured ? "red" : "gray");
+        // pending = ключ рабочий, но нужен ещё один клик — это не ошибка
+        const pending = !checked.ok && checked.pending ? checked.pending : "";
+        const level = checked.ok ? "green"
+            : (pending ? "blue" : (p.configured ? "red" : "gray"));
         const card = el("details", { class: "gr-conn", ...(checked.ok ? {} : { open: "" }) });
 
         const head = el("summary", { class: "gr-conn-head" });
@@ -135,7 +138,9 @@ export class ConnectionsUI {
         check.onclick = () => this.check(p, check);
         btns.appendChild(check);
         for (const a of p.actions || []) {
-            const b = el("button", { class: "gr-btn", title: a.title || "" }, esc(a.label));
+            // недостающее действие подсвечиваем — по нему и надо кликнуть
+            const b = el("button", { class: "gr-btn" + (pending === a.id ? " gr-primary" : ""),
+                title: a.title || "" }, esc(a.label));
             b.onclick = () => this.action(p, a, b);
             btns.appendChild(b);
         }
@@ -217,7 +222,10 @@ export class ConnectionsUI {
             this.applyCheck(p, r.check);
             this.data = r.status || this.data;
             toast("success", `${p.title}: ${a.label.toLowerCase()}`,
-                r.result?.gist_id ? `gist ${r.result.gist_id}` : "готово");
+                r.result?.gist_id
+                    ? `${r.result.reused ? "используется уже созданный" : "создан"} gist `
+                      + r.result.gist_id
+                    : "готово");
             this.render();
         } catch (e) {
             toast("error", `${p.title}: ${a.label.toLowerCase()}`, e.message, 9000);
@@ -227,8 +235,9 @@ export class ConnectionsUI {
     applyCheck(p, check) {
         if (!check) return;
         this.extra[p.id] = check.extra || {};
-        toast(check.ok ? "success" : "warn", p.title,
-            check.detail || (check.ok ? "готово" : "не проверено"),
+        // «остался один шаг» — это info, а не предупреждение: ключ уже принят
+        const sev = check.ok ? "success" : (check.pending ? "info" : "warn");
+        toast(sev, p.title, check.detail || (check.ok ? "готово" : "не проверено"),
             check.ok ? 4000 : 9000);
     }
 }
