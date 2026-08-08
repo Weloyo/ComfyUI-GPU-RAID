@@ -5,11 +5,13 @@ import { app } from "../../../scripts/app.js";
 import { gr, toast, clientId } from "./api.js";
 import { el, esc, fmtGb } from "./format.js";
 import { ProjectEditor } from "./editor.js";
+import { ModelsNodeUI } from "./models.js";
 
 export const NODE_STORY = "GPURAID_StoryDirector";
 export const NODE_LV = "GPURAID_LongVideo";
 export const NODE_OFFLOAD = "GPURAID_Offload";
 export const NODE_PIPELINE = "GPURAID_Pipeline";
+export const NODE_MODELS = "GPURAID_Models";
 
 // ---------------------------------------------------------------- утилиты
 
@@ -427,6 +429,8 @@ const BUILDERS = {
     }),
     [NODE_OFFLOAD]: (node) => new OffloadNodeUI(node),
     [NODE_PIPELINE]: (node) => new PipelineNodeUI(node),
+    [NODE_MODELS]: (node) => new ModelsNodeUI(
+        node, nodeBody(node, { width: 560, height: 420, minHeight: 220 })),
 };
 
 app.registerExtension({

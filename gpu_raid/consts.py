@@ -26,6 +26,7 @@ NODE_STORY_DIRECTOR = "GPURAID_StoryDirector"
 NODE_LONG_VIDEO = "GPURAID_LongVideo"
 NODE_OFFLOAD = "GPURAID_Offload"
 NODE_PIPELINE = "GPURAID_Pipeline"
+NODE_MODELS = "GPURAID_Models"
 NODE_VIDEO_SPEC = "GPURAID_VideoSpec"       # НЕ в GPURAID_CLASSES: выполняется и на воркерах
 NODE_SAVE_BUNDLE = "GPURAID_SaveBundle"     # тоже выполняются на воркерах (шардинг)
 NODE_LOAD_BUNDLE = "GPURAID_LoadBundle"
@@ -34,7 +35,7 @@ NODE_LOAD_BUNDLE = "GPURAID_LoadBundle"
 # вырезаются из ЛЮБОГО графа перед отправкой куда бы то ни было. Сценарист
 # отдаёт наружу текст сюжета, остальные вообще без выходов.
 GPURAID_MARKER_CLASSES = (NODE_STORY_DIRECTOR, NODE_LONG_VIDEO, NODE_OFFLOAD,
-                          NODE_PIPELINE)
+                          NODE_PIPELINE, NODE_MODELS)
 GPURAID_CLASSES = (NODE_DISTRIBUTOR, NODE_COLLECTOR, NODE_TILED_UPSCALE
                    ) + GPURAID_MARKER_CLASSES
 

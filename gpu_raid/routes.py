@@ -14,8 +14,8 @@ from aiohttp import web
 
 import server
 
-from . import (auth, config, downloads, events, kaggle_api, parity, providers,
-               results, storyplan)
+from . import (auth, config, distribute, downloads, events, kaggle_api, modelsrc,
+               parity, providers, results, storyplan)
 from . import longvideo as lv
 from . import pipeline
 from . import secrets as secret_store
@@ -465,6 +465,65 @@ async def self_download(request):
 @routes.get("/gpuraid/download_status/{task_id}")
 async def self_download_status(request):
     return web.json_response(downloads.status(request.match_info["task_id"]) or {"state": "unknown"})
+
+
+# ---------------------------------------------------------------------------
+# модели: библиотека публичных ссылок + рассылка на воркеров
+# ---------------------------------------------------------------------------
+
+@routes.get("/gpuraid/models/library")
+async def models_library(request):
+    _guard_master(request)
+    return web.json_response({"models": modelsrc.catalog()})
+
+
+@routes.post("/gpuraid/models/library")
+async def models_library_add(request):
+    _guard_master(request)
+    data = await _json(request)
+    try:
+        entry = modelsrc.upsert(data)
+    except ValueError as e:
+        return _err(400, e)
+    return web.json_response({"entry": entry, "warning": modelsrc.url_warning(entry["url"]),
+                              "models": modelsrc.catalog()})
+
+
+@routes.delete("/gpuraid/models/library/{folder}/{filename}")
+async def models_library_del(request):
+    _guard_master(request)
+    removed = modelsrc.remove(request.match_info["folder"], request.match_info["filename"])
+    return web.json_response({"removed": removed, "models": modelsrc.catalog()})
+
+
+@routes.post("/gpuraid/models/plan")
+async def models_plan(request):
+    _guard_master(request)
+    data = await _json(request)
+    try:
+        return web.json_response(await distribute.plan(data.get("graph") or {}))
+    except RewriteError as e:
+        return _err(409, e)
+    except Exception as e:
+        log.exception("models plan failed")
+        return _err(500, e)
+
+
+@routes.post("/gpuraid/models/distribute")
+async def models_distribute(request):
+    _guard_master(request)
+    data = await _json(request)
+    try:
+        return web.json_response(await distribute.start(data.get("items") or []))
+    except Exception as e:
+        log.exception("models distribute failed")
+        return _err(500, e)
+
+
+@routes.get("/gpuraid/models/progress")
+async def models_progress(request):
+    _guard_master(request)
+    return web.json_response(await distribute.progress())
 
 
 @routes.get("/gpuraid/catalog")

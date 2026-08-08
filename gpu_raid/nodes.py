@@ -16,9 +16,9 @@ import uuid
 log = logging.getLogger("gpu_raid")
 
 from .consts import (ASPECTS, NODE_COLLECTOR, NODE_DISTRIBUTOR, NODE_LOAD_BUNDLE,
-                     NODE_LONG_VIDEO, NODE_OFFLOAD, NODE_PIPELINE, NODE_SAVE_BUNDLE,
-                     NODE_STORY_DIRECTOR, NODE_TILED_UPSCALE, NODE_VIDEO_SPEC,
-                     SAVE_NODE_ID)
+                     NODE_LONG_VIDEO, NODE_MODELS, NODE_OFFLOAD, NODE_PIPELINE,
+                     NODE_SAVE_BUNDLE, NODE_STORY_DIRECTOR, NODE_TILED_UPSCALE,
+                     NODE_VIDEO_SPEC, SAVE_NODE_ID)
 from . import results, storyplan
 
 
@@ -527,6 +527,29 @@ class GPURaidPipeline:
         return ()
 
 
+class GPURaidModels:
+    """«Модели на воркерах»: сверка текущего графа с инвентарём и рассылка.
+
+    Модели выбираются как обычно — в лоадерах на канве. Эта нода только
+    показывает, у кого из воркеров нужных файлов нет, и запускает закачку:
+    каждый воркер тянет файл сам с публичной ссылки из библиотеки (панель →
+    «Модели»), мимо канала мастера.
+    """
+
+    CATEGORY = "GPU RAID"
+    RETURN_TYPES = ()
+    FUNCTION = "run"
+    DESCRIPTION = ("Матрица «модель × воркер» для текущего workflow и кнопка "
+                   "разослать недостающее. Воркеры качают напрямую с источника.")
+
+    @classmethod
+    def INPUT_TYPES(cls):
+        return {"required": {}}
+
+    def run(self):
+        return ()
+
+
 class GPURaidSaveBundle:
     """Сохраняет ЛЮБОЕ промежуточное значение (LATENT/CONDITIONING/IMAGE/AUDIO)
     в бандл-файл. Граница стадии конвейера — мастер вставляет её автоматически
@@ -620,6 +643,7 @@ NODE_CLASS_MAPPINGS = {
     NODE_LONG_VIDEO: GPURaidLongVideo,
     NODE_OFFLOAD: GPURaidOffload,
     NODE_PIPELINE: GPURaidPipeline,
+    NODE_MODELS: GPURaidModels,
     NODE_SAVE_BUNDLE: GPURaidSaveBundle,
     NODE_LOAD_BUNDLE: GPURaidLoadBundle,
 }
@@ -633,6 +657,7 @@ NODE_DISPLAY_NAME_MAPPINGS = {
     NODE_LONG_VIDEO: "GPU RAID Длинное видео",
     NODE_OFFLOAD: "GPU RAID Выполнить на воркере",
     NODE_PIPELINE: "GPU RAID Конвейер (шардинг)",
+    NODE_MODELS: "GPU RAID Модели на воркерах",
     NODE_SAVE_BUNDLE: "GPU RAID Save Bundle (шардинг)",
     NODE_LOAD_BUNDLE: "GPU RAID Load Bundle (шардинг)",
 }

@@ -8,6 +8,7 @@ import { gr, toast } from "./api.js";
 import { el, esc, fmtDur, fmtGb, platformBadge, stateDot } from "./format.js";
 import { openProjectOnCanvas } from "./nodeui.js";
 import { ConnectionsUI } from "./connections.js";
+import { ModelLibraryUI } from "./models.js";
 
 export class GPURaidPanel {
     constructor(root) {
@@ -122,11 +123,13 @@ export class GPURaidPanel {
         this.elWorkers = mk("workers", "Воркеры");
         this.elAdd = mk("add", "Добавить воркеров", false);
         this.elConn = mk("connections", "Подключения и ключи", false);
+        this.elModels = mk("models", "Модели: ссылки для воркеров", false);
         this.elJobs = mk("jobs", "Задания");
         this.elProjects = mk("projects", "Проекты видео", false);
         this.elHistory = mk("history", "История", false);
         this.buildModes();
         this.buildAdd();
+        this.library = new ModelLibraryUI(this.elModels);
         this.connections = new ConnectionsUI(this.elConn);
         this.connections.onSummary = (ok, total) => {
             this._summaries.connections.textContent =
