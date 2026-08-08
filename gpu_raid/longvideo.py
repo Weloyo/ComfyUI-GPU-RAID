@@ -17,11 +17,12 @@ GPURAID:START_IMAGE / GPURAID:END_IMAGE / GPURAID:PROMPT / GPURAID:VIDEO_OUT.
 
 import logging
 import os
+import shutil
 import time
 
 import folder_paths
 
-from . import config, events, results, video
+from . import config, events, results, storyplan, video
 from .dispatcher import MANAGER, DEAD, DONE, Job, Unit, UnitCancelled, UnitFailure
 from .graph_rewrite import (
     RewriteError,
@@ -58,7 +59,9 @@ def load_manifest(name):
 
 def save_manifest(manifest):
     config.save_json_atomic(_manifest_path(manifest["label"]), manifest)
-    events.send("longvideo", {"label": manifest["label"], "manifest": manifest})
+    # в WS уходит облегчённый вид: template_graph может весить сотни КБ
+    events.send("longvideo", {"label": manifest["label"],
+                              "manifest": storyplan.trim_manifest_view(manifest)})
 
 
 def list_jobs():
@@ -159,6 +162,7 @@ async def start(graph, params, client_id):
     job.unit_uploads = {}
 
     manifest = {
+        "schema": storyplan.SCHEMA,
         "label": unique_label,
         "mode": mode,
         "created": int(time.time()),
@@ -170,6 +174,7 @@ async def start(graph, params, client_id):
         "seed": base_seed,
         "seed_policy": policy,
         "segments": [],
+        "edit": storyplan.default_edit(),
         "final": None,
     }
 
@@ -222,6 +227,7 @@ async def start(graph, params, client_id):
 async def _run_chain(job, spec, manifest, count, prompts, base_seed, policy, start_value):
     frames_rel_dir = f"gpuraid_lv/{job.job_id}"
     frames_abs_dir = os.path.join(config.input_dir(), frames_rel_dir)
+    manifest["frames_dir"] = frames_rel_dir  # кадры нужны rerender'у; чистятся при удалении проекта
     current_start = start_value
     try:
         for i in range(count):
@@ -272,7 +278,7 @@ async def _run_chain(job, spec, manifest, count, prompts, base_seed, policy, sta
         MANAGER._archive(job)
 
 
-async def _execute_on_any(job, unit):
+async def _execute_on_any(job, unit, fetch="longvideo"):
     """Последовательный сегмент: пробуем воркеров по очереди (локальный первым)."""
     records = await MANAGER._eligible_workers(job)
     records.sort(key=lambda r: (r["id"] != LOCAL_ID,
@@ -285,7 +291,7 @@ async def _execute_on_any(job, unit):
     for record in records:
         wc = REGISTRY.client(record)
         try:
-            await MANAGER._execute_unit(job, record, wc, unit, fetch="longvideo")
+            await MANAGER._execute_unit(job, record, wc, unit, fetch=fetch)
             job.stats["per_worker"][record["id"]] = job.stats["per_worker"].get(record["id"], 0) + 1
             return True
         except UnitCancelled:
@@ -341,7 +347,7 @@ async def _finalize(job, manifest):
 # операции над готовым проектом (панель-редактор)
 # ---------------------------------------------------------------------------
 
-async def rerender_segment(label, index, seed=None):
+async def rerender_segment(label, index, seed=None, prompt=None):
     manifest = load_manifest(label)
     if not manifest:
         raise RewriteError(f"Проект {label} не найден")
@@ -361,13 +367,16 @@ async def rerender_segment(label, index, seed=None):
     job.unit_uploads = {}
 
     new_seed = int(seed) if seed is not None else int.from_bytes(os.urandom(6), "big")
+    new_prompt = str(prompt) if prompt is not None else seg.get("prompt")
     unit, ugraph = _make_unit(job, spec, index, seg.get("start_image"),
-                              seg.get("end_image"), seg.get("prompt"), new_seed)
+                              seg.get("end_image"), new_prompt, new_seed)
     job.units.append(unit)
     job.unit_graphs = {index: ugraph}
     job.unit_uploads[index] = _uploads_for_graph(ugraph, job.job_id)
     job.build_graph = lambda u: job.unit_graphs[u.index]
     seg["status"] = "rendering"
+    seg["prompt"] = new_prompt      # новый промпт персистится до рендера:
+    seg.pop("dirty", None)          # переживает рестарт и снимает флаг dirty
     save_manifest(manifest)
     MANAGER._register(job)
 
@@ -391,13 +400,62 @@ async def rerender_segment(label, index, seed=None):
     return job
 
 
-async def export(label, order=None, trims=None, crossfade_s=0.0):
+async def update_segment(label, index, patch):
+    """Правка prompt/seed/duration_s сегмента с персистом в манифест."""
+    manifest = load_manifest(label)
+    if not manifest:
+        raise RewriteError(f"Проект {label} не найден")
+    seg = next((s for s in manifest.get("segments", []) if s["index"] == index), None)
+    if seg is None:
+        raise RewriteError(f"Сегмент {index} не найден")
+    storyplan.apply_segment_patch(seg, patch)
+    save_manifest(manifest)
+    return seg
+
+
+async def update_edit(label, edit):
+    """Персист состояния редактора (order/excluded/trims/crossfade_s)."""
+    manifest = load_manifest(label)
+    if not manifest:
+        raise RewriteError(f"Проект {label} не найден")
+    storyplan.merge_edit(manifest, edit)
+    save_manifest(manifest)
+    return manifest["edit"]
+
+
+async def delete_project(label):
+    manifest = load_manifest(label)
+    if not manifest:
+        raise RewriteError(f"Проект {label} не найден")
+    input_base = os.path.abspath(config.input_dir())
+    for rel in (manifest.get("frames_dir"),
+                f"gpuraid_story/{config.sanitize_name(label)}"):
+        if not rel:
+            continue
+        path = os.path.abspath(os.path.join(input_base, rel))
+        if path.startswith(input_base):
+            shutil.rmtree(path, ignore_errors=True)
+    shutil.rmtree(os.path.join(config.deliver_base(), config.sanitize_name(label)),
+                  ignore_errors=True)
+    events.send("longvideo", {"label": label, "deleted": True})
+    return True
+
+
+async def export(label, order=None, trims=None, crossfade_s=None):
     manifest = load_manifest(label)
     if not manifest:
         raise RewriteError(f"Проект {label} не найден")
     outdir = os.path.join(config.deliver_base(), config.sanitize_name(label))
     segments = {s["index"]: s for s in manifest.get("segments", [])}
-    order = order if order else sorted(segments)
+    stored = manifest.get("edit") or {}
+    if order is None:
+        order = stored.get("order") or sorted(segments)
+        excluded = {int(i) for i in (stored.get("excluded") or [])}
+        order = [i for i in order if int(i) not in excluded]
+    if trims is None:
+        trims = stored.get("trims") or {}
+    if crossfade_s is None:
+        crossfade_s = stored.get("crossfade_s") or 0
     trims = trims or {}
 
     items = []

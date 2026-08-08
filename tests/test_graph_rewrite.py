@@ -7,13 +7,17 @@ from gpu_raid.graph_rewrite import (
     RewriteError,
     ancestors,
     apply_remap,
+    apply_videospec_overrides,
     build_tail,
     build_unit_template,
     classify_job_type,
     collect_upload_refs,
     descendants,
     extract_requirements,
+    extract_story_director,
+    prepare_keyframe_template,
     prepare_segment_template,
+    render_keyframe,
     render_segment,
     render_unit,
     splice_gpuraid,
@@ -213,3 +217,145 @@ def test_longvideo_autodetect_and_errors():
         assert False, "Distributor в шаблоне LV — должно падать"
     except RewriteError:
         pass
+
+
+# ---------------------------------------------------------------------------
+# Story: шаблон кадра, Сценарист, VideoSpec
+# ---------------------------------------------------------------------------
+
+def kf_graph():
+    return {
+        "1": {"class_type": "CheckpointLoaderSimple", "inputs": {"ckpt_name": "sdxl.safetensors"}},
+        "2": {"class_type": "EmptyLatentImage",
+              "inputs": {"width": 512, "height": 512, "batch_size": 1}},
+        "3": {"class_type": "CLIPTextEncode", "inputs": {"text": "frame", "clip": ["1", 1]}},
+        "4": {"class_type": "CLIPTextEncode", "inputs": {"text": "bad", "clip": ["1", 1]},
+              "_meta": {"title": "негатив"}},
+        "5": {"class_type": "KSampler", "inputs": {
+            "seed": 7, "model": ["1", 0], "positive": ["3", 0], "negative": ["4", 0],
+            "latent_image": ["2", 0]}},
+        "6": {"class_type": "VAEDecode", "inputs": {"samples": ["5", 0], "vae": ["1", 2]}},
+        "7": {"class_type": "SaveImage", "inputs": {"images": ["6", 0], "filename_prefix": "kf"}},
+    }
+
+
+def test_keyframe_template_marker_required_for_two_prompts():
+    # два CLIPTextEncode с литеральным text и без маркера -> ошибка
+    try:
+        prepare_keyframe_template(kf_graph())
+        assert False, "два текстовых кандидата без маркера — должно падать"
+    except RewriteError:
+        pass
+    g = kf_graph()
+    g["3"]["_meta"] = {"title": "GPURAID:PROMPT"}
+    spec = prepare_keyframe_template(g)
+    assert spec["prompt"] == "3" and spec["prompt_key"] == "text"
+    # Save-нода заменена синтетической с PREFIX_PH
+    assert "7" not in spec["template"]
+    assert spec["template"][SAVE_NODE_ID]["inputs"]["images"] == ["6", 0]
+    assert spec["template"][SAVE_NODE_ID]["inputs"]["filename_prefix"] == PREFIX_PH
+
+
+def test_keyframe_template_single_prompt_autodetect():
+    g = kf_graph()
+    g["4"]["inputs"]["text"] = ["9", 0]  # негатив со связью -> не кандидат
+    spec = prepare_keyframe_template(g)
+    assert spec["prompt"] == "3"
+
+
+def test_render_keyframe():
+    g = kf_graph()
+    g["3"]["_meta"] = {"title": "GPURAID:PROMPT"}
+    spec = prepare_keyframe_template(g)
+    out = render_keyframe(spec, "sunset pier", 42, 1344, 768, "tmp/k000")
+    assert out["3"]["inputs"]["text"] == "sunset pier"
+    assert out["5"]["inputs"]["seed"] == 42
+    assert out["2"]["inputs"]["width"] == 1344      # Empty*Latent* получает канву
+    assert out["2"]["inputs"]["height"] == 768
+    assert out[SAVE_NODE_ID]["inputs"]["filename_prefix"] == "tmp/k000"
+    # шаблон не мутирован
+    assert spec["template"]["3"]["inputs"]["text"] == "frame"
+    assert spec["template"]["2"]["inputs"]["width"] == 512
+
+
+def test_keyframe_template_rejects_gpuraid_nodes():
+    g = kf_graph()
+    g["3"]["_meta"] = {"title": "GPURAID:PROMPT"}
+    g["99"] = {"class_type": "GPURAID_StoryDirector", "inputs": {"story": "x"}}
+    try:
+        prepare_keyframe_template(g)
+        assert False, "GPURAID-нода в шаблоне кадра — должно падать"
+    except RewriteError:
+        pass
+
+
+def story_graph():
+    g = lv_graph()
+    g["50"] = {"class_type": "GPURAID_StoryDirector", "inputs": {
+        "story": "Лодка уходит в шторм.", "label": "boat", "segments_count": 2,
+        "segment_duration_s": 4.0, "fps": 24, "aspect": "16:9", "short_edge": 768,
+        "snap": "minimax_h3", "use_llm": False, "seed": 5}}
+    return g
+
+
+def test_extract_story_director():
+    params, g = extract_story_director(story_graph())
+    assert params["story"] == "Лодка уходит в шторм."
+    assert params["label"] == "boat"
+    assert params["segments_count"] == 2
+    assert params["use_llm"] is False
+    assert "50" not in g
+    # без Сценариста — params None, граф не тронут
+    p2, g2 = extract_story_director(lv_graph())
+    assert p2 is None and "1" in g2
+    # два Сценариста — ошибка
+    g3 = story_graph()
+    g3["51"] = dict(g3["50"])
+    try:
+        extract_story_director(g3)
+        assert False
+    except RewriteError:
+        pass
+
+
+def test_segment_template_rejects_director_but_extract_first_works():
+    # prepare_segment_template должен падать, пока Сценарист в графе...
+    try:
+        prepare_segment_template(story_graph())
+        assert False, "Сценарист в шаблоне — должно падать"
+    except RewriteError:
+        pass
+    # ...а после извлечения — работать
+    _, g = extract_story_director(story_graph())
+    spec = prepare_segment_template(g)
+    assert spec["start"] == "1" and spec["end"] == "2"
+
+
+def test_videospec_overrides_and_segment_render():
+    g = lv_graph()
+    g["60"] = {"class_type": "GPURAID_VideoSpec", "inputs": {
+        "duration_s": 5.0, "fps": 24, "aspect": "16:9", "short_edge": 768,
+        "snap": "minimax_h3"}}
+    spec = prepare_segment_template(g)
+    out = render_segment(spec, "a.png", "b.png", "p", 1,
+                         prefix="tmp/s0",
+                         overrides={"duration_s": 3.0, "fps": 24, "aspect": "9:16",
+                                    "short_edge": 768, "snap": "minimax_h3"})
+    assert out["60"]["inputs"]["duration_s"] == 3.0
+    assert out["60"]["inputs"]["aspect"] == "9:16"
+    # шаблон не мутирован
+    assert spec["template"]["60"]["inputs"]["duration_s"] == 5.0
+    # связный виджет не перезаписывается
+    g2 = lv_graph()
+    g2["60"] = {"class_type": "GPURAID_VideoSpec", "inputs": {
+        "duration_s": ["5", 0], "fps": 24, "aspect": "16:9", "short_edge": 768,
+        "snap": "minimax_h3"}}
+    copy_g2 = copy.deepcopy(g2)
+    apply_videospec_overrides(copy_g2, {"duration_s": 9.0})
+    assert copy_g2["60"]["inputs"]["duration_s"] == ["5", 0]
+
+
+def test_splice_removes_story_director():
+    g, warnings = splice_gpuraid(story_graph())
+    assert "50" not in g
+    assert any("Сценарист" in w for w in warnings)

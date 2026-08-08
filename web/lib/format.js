@@ -13,8 +13,16 @@ export function fmtDur(seconds) {
 }
 
 export function stateDot(state) {
-    const map = { online: "gr-dot-green", offline: "gr-dot-red", unknown: "gr-dot-gray" };
+    const map = {
+        online: "gr-dot-green", offline: "gr-dot-red",
+        stopped: "gr-dot-blue", unknown: "gr-dot-gray",
+    };
     return map[state] || "gr-dot-gray";
+}
+
+export function platformBadge(platform) {
+    const map = { colab: "колаб", kaggle: "каггл", generic: "облако" };
+    return map[platform] || "";
 }
 
 export function esc(text) {

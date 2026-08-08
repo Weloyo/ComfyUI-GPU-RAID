@@ -1,4 +1,4 @@
-"""Ноды GPU RAID: Distributor, Collector, TiledUpscale."""
+"""Ноды GPU RAID: Distributor, Collector, TiledUpscale, VideoSpec, StoryDirector."""
 
 import logging
 import os
@@ -8,8 +8,21 @@ import uuid
 
 log = logging.getLogger("gpu_raid")
 
-from .consts import NODE_COLLECTOR, NODE_DISTRIBUTOR, NODE_TILED_UPSCALE, SAVE_NODE_ID
-from . import results
+from .consts import (ASPECTS, NODE_COLLECTOR, NODE_DISTRIBUTOR, NODE_LOAD_BUNDLE,
+                     NODE_SAVE_BUNDLE, NODE_STORY_DIRECTOR, NODE_TILED_UPSCALE,
+                     NODE_VIDEO_SPEC, SAVE_NODE_ID)
+from . import results, storyplan
+
+
+class AnyType(str):
+    """Wildcard-«тип» для Save/LoadBundle: не равен ничему по __ne__ —
+    фронтенд/валидатор пропускают соединение с любым типом (приём rgthree)."""
+
+    def __ne__(self, _other):
+        return False
+
+
+ANY_TYPE = AnyType("*")
 
 
 class GPURaidDistributor:
@@ -323,14 +336,182 @@ class GPURaidTiledUpscale:
         return (out,)
 
 
+class GPURaidVideoSpec:
+    """Спецификация видео: длительность/аспект/разрешение/fps -> width/height/length.
+
+    Универсальная нода (работает и на воркерах): подключите width/height/length
+    к видео-ноде (для MiniMax H3 — вместо ComfyMathExpression из шаблона).
+    snap=minimax_h3 выравнивает кадры по сетке 17k+5 и канву по правилам H3.
+    Сценарист правит duration_s этой ноды при рендере каждого сегмента.
+    """
+
+    CATEGORY = "GPU RAID"
+    RETURN_TYPES = ("INT", "INT", "INT", "INT", "FLOAT")
+    RETURN_NAMES = ("width", "height", "length", "fps", "duration_s")
+    FUNCTION = "run"
+    DESCRIPTION = ("Длительность, соотношение сторон, разрешение и fps одним узлом. "
+                   "length = кадры с учётом сетки модели (minimax_h3: 17k+5).")
+
+    @classmethod
+    def INPUT_TYPES(cls):
+        return {
+            "required": {
+                "duration_s": ("FLOAT", {"default": 5.0, "min": 0.2, "max": 3600.0,
+                                         "step": 0.1}),
+                "fps": ("INT", {"default": 24, "min": 1, "max": 120}),
+                "aspect": (list(ASPECTS), {"default": "16:9"}),
+                "short_edge": ("INT", {"default": 768, "min": 64, "max": 4096,
+                                       "step": 32}),
+                "snap": (["minimax_h3", "none"], {"default": "minimax_h3"}),
+            }
+        }
+
+    def run(self, duration_s, fps, aspect, short_edge, snap):
+        width, height = storyplan.canvas(aspect, short_edge, snap)
+        length = storyplan.align_frames(duration_s, fps, snap)
+        return (int(width), int(height), int(length), int(fps), float(duration_s))
+
+
+class GPURaidStoryDirector:
+    """«Сценарист»: маркер-нода с параметрами истории.
+
+    Сама нода ничего не рендерит: нажатие Queue перехватывается расширением —
+    LLM (или эвристика) разбивает сюжет на сегменты, план появляется в панели
+    GPU RAID (раздел «Сценарист»), где промпты правятся до и после рендера.
+    """
+
+    CATEGORY = "GPU RAID"
+    RETURN_TYPES = ("STRING",)
+    RETURN_NAMES = ("story",)
+    FUNCTION = "run"
+    DESCRIPTION = ("Опишите сюжет — Queue разберёт его на сегменты (first/last кадры "
+                   "+ промпт на сегмент, всё редактируется в панели), воркеры "
+                   "отрендерят сегменты параллельно, итог склеится в одно видео.")
+
+    @classmethod
+    def INPUT_TYPES(cls):
+        return {
+            "required": {
+                "story": ("STRING", {"multiline": True, "default": ""}),
+                "label": ("STRING", {"default": "story"}),
+                "segments_count": ("INT", {"default": 0, "min": 0, "max": 64,
+                                           "tooltip": "0 = авто (решает LLM/эвристика)"}),
+                "segment_duration_s": ("FLOAT", {"default": 5.0, "min": 0.5, "max": 60.0,
+                                                 "step": 0.5}),
+                "fps": ("INT", {"default": 24, "min": 1, "max": 120}),
+                "aspect": (list(ASPECTS), {"default": "16:9"}),
+                "short_edge": ("INT", {"default": 768, "min": 64, "max": 4096,
+                                       "step": 32}),
+                "snap": (["minimax_h3", "none"], {"default": "minimax_h3"}),
+                "use_llm": ("BOOLEAN", {"default": True}),
+                "seed": ("INT", {"default": 0, "min": 0, "max": 0xFFFFFFFFFFFFFFFF}),
+            }
+        }
+
+    def run(self, story, **_kw):
+        return (str(story or ""),)
+
+
+class GPURaidSaveBundle:
+    """Сохраняет ЛЮБОЕ промежуточное значение (LATENT/CONDITIONING/IMAGE/AUDIO)
+    в бандл-файл. Граница стадии конвейера — мастер вставляет её автоматически
+    при шардинге; руками нода тоже работает."""
+
+    CATEGORY = "GPU RAID"
+    RETURN_TYPES = ()
+    OUTPUT_NODE = True
+    FUNCTION = "run"
+    DESCRIPTION = "Пишет значение в output/<prefix>_NNNNN_.safetensors (бандл GPU RAID)."
+
+    @classmethod
+    def INPUT_TYPES(cls):
+        return {
+            "required": {
+                "value": (ANY_TYPE,),
+                "filename_prefix": ("STRING", {"default": "gpuraid_bundle/b"}),
+            },
+            "optional": {
+                "data_type": ("STRING", {"default": ""}),
+            },
+        }
+
+    def run(self, value, filename_prefix, data_type=""):
+        import folder_paths
+
+        from . import bundle as bundle_mod
+
+        full_out, filename, counter, subfolder, _ = folder_paths.get_save_image_path(
+            filename_prefix, folder_paths.get_output_directory())
+        name = f"{filename}_{counter:05}_.safetensors"
+        stats = bundle_mod.save_bundle(os.path.join(full_out, name), value, data_type)
+        log.info("bundle saved: %s/%s (%d т., %.1f МБ)", subfolder, name,
+                 stats["tensors"], stats["bytes"] / 1e6)
+        return {"ui": {"gpuraid_bundles": [{
+            "filename": name, "subfolder": subfolder, "type": "output",
+            "bytes": stats["bytes"],
+        }]}}
+
+
+class GPURaidLoadBundle:
+    """Загружает бандл (см. SaveBundle) и отдаёт значение дальше по графу."""
+
+    CATEGORY = "GPU RAID"
+    RETURN_TYPES = (ANY_TYPE,)
+    RETURN_NAMES = ("value",)
+    FUNCTION = "run"
+    DESCRIPTION = "Путь относительно input-каталога (файл приезжает от мастера автоматически)."
+
+    @classmethod
+    def INPUT_TYPES(cls):
+        return {"required": {"bundle": ("STRING", {"default": ""})}}
+
+    def run(self, bundle):
+        import folder_paths
+
+        from . import bundle as bundle_mod
+
+        path = folder_paths.get_annotated_filepath(bundle)
+        if not path or not os.path.isfile(path):
+            raise RuntimeError(f"GPU RAID LoadBundle: файл не найден: {bundle}")
+        payload, _dtype = bundle_mod.load_bundle(path)
+        return (payload,)
+
+    @classmethod
+    def IS_CHANGED(cls, bundle):
+        import folder_paths
+
+        path = folder_paths.get_annotated_filepath(bundle)
+        try:
+            st = os.stat(path)
+            return f"{st.st_size}:{st.st_mtime_ns}"
+        except (OSError, TypeError):
+            return float("nan")
+
+    @classmethod
+    def VALIDATE_INPUTS(cls, bundle):
+        # приняв параметр по имени, отключаем стандартную combo-валидацию;
+        # существование проверяем сами (файл мог только что приехать от мастера)
+        if not str(bundle or "").strip():
+            return "укажите файл бандла"
+        return True
+
+
 NODE_CLASS_MAPPINGS = {
     NODE_DISTRIBUTOR: GPURaidDistributor,
     NODE_COLLECTOR: GPURaidCollector,
     NODE_TILED_UPSCALE: GPURaidTiledUpscale,
+    NODE_VIDEO_SPEC: GPURaidVideoSpec,
+    NODE_STORY_DIRECTOR: GPURaidStoryDirector,
+    NODE_SAVE_BUNDLE: GPURaidSaveBundle,
+    NODE_LOAD_BUNDLE: GPURaidLoadBundle,
 }
 
 NODE_DISPLAY_NAME_MAPPINGS = {
     NODE_DISTRIBUTOR: "GPU RAID Distributor (seed)",
     NODE_COLLECTOR: "GPU RAID Collector",
     NODE_TILED_UPSCALE: "GPU RAID Tiled Upscale",
+    NODE_VIDEO_SPEC: "GPU RAID Видео-спека",
+    NODE_STORY_DIRECTOR: "GPU RAID Сценарист",
+    NODE_SAVE_BUNDLE: "GPU RAID Save Bundle (шардинг)",
+    NODE_LOAD_BUNDLE: "GPU RAID Load Bundle (шардинг)",
 }

@@ -4,8 +4,11 @@
 никаких импортов server/torch/folder_paths.
 """
 
-VERSION = "0.1.0"
+VERSION = "0.2.0"
 EXT_NAME = "comfyui-gpu-raid"
+REPO_URL = "https://github.com/Weloyo/ComfyUI-GPU-RAID"
+COLAB_NOTEBOOK_URL = ("https://colab.research.google.com/github/Weloyo/"
+                      "ComfyUI-GPU-RAID/blob/main/notebooks/colab_worker.ipynb")
 
 # --- auth ---
 TOKEN_HEADER = "X-GPURAID-Token"
@@ -19,7 +22,12 @@ FORWARD_HEADERS = ("CF-Connecting-IP", "X-Forwarded-For", "X-Real-IP")
 NODE_DISTRIBUTOR = "GPURAID_Distributor"
 NODE_COLLECTOR = "GPURAID_Collector"
 NODE_TILED_UPSCALE = "GPURAID_TiledUpscale"
-GPURAID_CLASSES = (NODE_DISTRIBUTOR, NODE_COLLECTOR, NODE_TILED_UPSCALE)
+NODE_STORY_DIRECTOR = "GPURAID_StoryDirector"
+NODE_VIDEO_SPEC = "GPURAID_VideoSpec"       # НЕ в GPURAID_CLASSES: выполняется и на воркерах
+NODE_SAVE_BUNDLE = "GPURAID_SaveBundle"     # тоже выполняются на воркерах (шардинг)
+NODE_LOAD_BUNDLE = "GPURAID_LoadBundle"
+GPURAID_CLASSES = (NODE_DISTRIBUTOR, NODE_COLLECTOR, NODE_TILED_UPSCALE,
+                   NODE_STORY_DIRECTOR)
 
 # --- плейсхолдеры юнит-шаблона ---
 SEED_PH = "__GPURAID_SEED__"
@@ -27,11 +35,15 @@ INDEX_PH = "__GPURAID_INDEX__"
 PREFIX_PH = "__GPURAID_PREFIX__"
 SAVE_NODE_ID = "gpuraid_save"
 
-# --- маркеры Long Video (заголовки нод, регистронезависимо) ---
+# --- маркеры Long Video / Story (заголовки нод, регистронезависимо) ---
 LV_START = "GPURAID:START_IMAGE"
 LV_END = "GPURAID:END_IMAGE"
 LV_PROMPT = "GPURAID:PROMPT"
 LV_OUT = "GPURAID:VIDEO_OUT"
+LV_KEYFRAME_OUT = "GPURAID:KEYFRAME_OUT"
+
+# аспекты для VideoSpec/Сценариста
+ASPECTS = ("16:9", "9:16", "1:1", "4:3", "3:4", "21:9")
 
 # class_type -> {имя входа: папка моделей}
 LOADER_TABLE = {
@@ -74,6 +86,7 @@ UPLOAD_TABLE = {
     "LoadImageOutput": ("image",),
     "VHS_LoadVideo": ("video",),
     "LoadAudio": ("audio",),
+    NODE_LOAD_BUNDLE: ("bundle",),
 }
 
 # классы, чьи выходные файлы забираем при offload/longvideo как «видео-выход»
@@ -95,6 +108,7 @@ DEFAULT_SETTINGS = {
     "max_retries": 2,
     "keep_last_jobs": 5,
     "heartbeat_s": 15,
+    "free_after_job": False,
     "timeouts": {
         "probe_s": 5,
         "image_startup_s": 240,
@@ -103,11 +117,57 @@ DEFAULT_SETTINGS = {
         "video_stall_s": 300,
         "hard_cap_s": 39600,
     },
+    # политика питания облачных воркеров: keep | eco | instant | local_only
+    "lifecycle": {
+        "policy": "eco",
+        "idle_stop_min": 10,
+        "budget_min": 0,           # 0 = без потолка длительности сессии
+        "auto_start_kaggle": False,
+    },
+    # OpenAI-совместимый endpoint для «Сценариста» (ключ — в secrets.json)
+    "llm": {
+        "base_url": "",
+        "model": "",
+        "temperature": 0.7,
+    },
+    # авторегистрация воркеров через приватный GitHub Gist
+    "rendezvous": {
+        "gist_id": "",
+        "poll_s": 30,
+    },
 }
 
 # небольшой каталог проверенных URL для «Download to worker»
 # (произвольные HF/Civitai URL тоже принимаются)
 MODEL_CATALOG = [
+    {
+        "name": "MiniMax H3 diffusion (int8)",
+        "filename": "minimax_h3_fl2va_pruned_int8_convrot.safetensors",
+        "folder": "diffusion_models",
+        "size_gb": 19.5,
+        "url": "https://huggingface.co/Comfy-Org/MiniMax-H3/resolve/main/diffusion_models/minimax_h3_fl2va_pruned_int8_convrot.safetensors",
+    },
+    {
+        "name": "MiniMax H3 text encoder (Qwen3-VL nvfp4)",
+        "filename": "qwen3vl_32b_minimax_h3_nvfp4_awq.safetensors",
+        "folder": "text_encoders",
+        "size_gb": 14.6,
+        "url": "https://huggingface.co/Comfy-Org/MiniMax-H3/resolve/main/text_encoders/qwen3vl_32b_minimax_h3_nvfp4_awq.safetensors",
+    },
+    {
+        "name": "MiniMax H3 video VAE (fp16)",
+        "filename": "minimax_h3_video_vae_fp16.safetensors",
+        "folder": "vae",
+        "size_gb": 4.9,
+        "url": "https://huggingface.co/Comfy-Org/MiniMax-H3/resolve/main/vae/minimax_h3_video_vae_fp16.safetensors",
+    },
+    {
+        "name": "MiniMax H3 audio VAE (fp32)",
+        "filename": "minimax_h3_audio_vae_fp32.safetensors",
+        "folder": "vae",
+        "size_gb": 0.6,
+        "url": "https://huggingface.co/Comfy-Org/MiniMax-H3/resolve/main/vae/minimax_h3_audio_vae_fp32.safetensors",
+    },
     {
         "name": "SDXL Base 1.0",
         "filename": "sd_xl_base_1.0.safetensors",

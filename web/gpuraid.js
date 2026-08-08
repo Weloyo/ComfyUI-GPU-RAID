@@ -36,12 +36,35 @@ function graphHasStripe(output) {
     return false;
 }
 
+function graphHasStory(output) {
+    if (!output) return false;
+    for (const node of Object.values(output)) {
+        if (node.class_type === "GPURAID_StoryDirector") return true;
+    }
+    return false;
+}
+
 function hookQueue() {
     const original = api.queuePrompt.bind(api);
     api.queuePrompt = async function (number, data, ...rest) {
         try {
             if (!setting("GPURaid.Enabled", true)) return original(number, data, ...rest);
             const output = data?.output;
+            if (graphHasStory(output) && !graphHasStripe(output)) {
+                // Сценарист: Queue = «составить план», рендер запускается из панели.
+                // Локальный прогон FLF2V-шаблона с кадрами-заглушками бессмыслен,
+                // поэтому при ошибке валидации показываем причину и НЕ запускаем.
+                try {
+                    const r = await gr.post("/story/plan", {
+                        graph: output, client_id: clientId(),
+                    });
+                    toast("info", "Сценарист: план готов",
+                        `«${r.label}» — панель GPU RAID → Long Video → Редактор`);
+                } catch (e) {
+                    toast(e.status === 409 ? "warn" : "error", "Сценарист", e.message, 8000);
+                }
+                return { prompt_id: "", number: -1, node_errors: {} };
+            }
             if (!graphHasStripe(output)) return original(number, data, ...rest);
             try {
                 const r = await gr.post("/stripe", {

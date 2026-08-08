@@ -14,12 +14,15 @@ from .consts import (
     INDEX_PH,
     LOADER_TABLE,
     LV_END,
+    LV_KEYFRAME_OUT,
     LV_OUT,
     LV_PROMPT,
     LV_START,
     NODE_COLLECTOR,
     NODE_DISTRIBUTOR,
+    NODE_STORY_DIRECTOR,
     NODE_TILED_UPSCALE,
+    NODE_VIDEO_SPEC,
     PREFIX_PH,
     SAVE_NODE_ID,
     SEED_KEYS,
@@ -261,6 +264,14 @@ def splice_gpuraid(graph):
             warnings.append("GPU RAID Tiled Upscale пропущен на воркере (изображение передано без апскейла)")
         g.pop(t_id)
 
+    for s_id in find_by_class(g, NODE_STORY_DIRECTOR):
+        story = g[s_id].get("inputs", {}).get("story", "")
+        if is_link(story):
+            story = ""
+        _replace_links_to(g, s_id, {0: str(story or "")})
+        g.pop(s_id)
+        warnings.append("Сценарист вырезан (это маркер-нода мастера)")
+
     # подчистка повисших ссылок (потребители удалённых нод с value None)
     for nid, node in g.items():
         for key, value in list(node.get("inputs", {}).items()):
@@ -383,9 +394,12 @@ def prepare_segment_template(graph):
       GPURAID:VIDEO_OUT   — нода сохранения видео (иначе автоопределение)
     """
     g = copy.deepcopy(graph)
-    for ct in (NODE_DISTRIBUTOR, NODE_COLLECTOR):
+    for ct in (NODE_DISTRIBUTOR, NODE_COLLECTOR, NODE_STORY_DIRECTOR):
         if find_by_class(g, ct):
-            raise RewriteError("Уберите ноды Distributor/Collector из шаблона Long Video")
+            raise RewriteError(
+                "Уберите ноды Distributor/Collector/Сценарист из шаблона сегмента "
+                "(Сценарист вырезается автоматически при запуске через Queue/панель)"
+            )
 
     start_id = _find_titled(g, LV_START)
     if start_id is None:
@@ -446,7 +460,45 @@ def prepare_segment_template(graph):
     }
 
 
-def render_segment(spec, start_image, end_image, prompt, seed, prefix):
+def _apply_seed(g, seed):
+    """Перебивает все НЕсвязные seed/noise_seed виджеты графа одним значением.
+
+    Осознанно blanket: шаблоны сегментов/кадров одно-семплерные; workflow с
+    несколькими намеренно разными сидами Сценаристу не подходит.
+    """
+    if seed is None:
+        return
+    for node in g.values():
+        inputs = node.get("inputs", {})
+        for key in SEED_KEYS:
+            if key in inputs and not is_link(inputs[key]):
+                try:
+                    int(inputs[key])
+                except (TypeError, ValueError):
+                    continue
+                inputs[key] = int(seed)
+
+
+VIDEO_SPEC_KEYS = ("duration_s", "fps", "aspect", "short_edge", "snap")
+
+
+def apply_videospec_overrides(g, overrides):
+    """Правит виджеты нод GPURAID_VideoSpec (длительность/аспект/fps и т.п.).
+
+    Только literal-виджеты; чужие ноды не трогаются — никаких blanket-перезаписей
+    ширины/высоты по графу.
+    """
+    if not overrides:
+        return
+    for nid in find_by_class(g, NODE_VIDEO_SPEC):
+        inputs = g[nid].setdefault("inputs", {})
+        for key in VIDEO_SPEC_KEYS:
+            if key in overrides and overrides[key] is not None \
+                    and not is_link(inputs.get(key)):
+                inputs[key] = overrides[key]
+
+
+def render_segment(spec, start_image, end_image, prompt, seed, prefix, overrides=None):
     """Собирает граф одного сегмента из шаблона spec."""
     g = copy.deepcopy(spec["template"])
     g[spec["start"]]["inputs"][spec["start_key"]] = start_image
@@ -455,16 +507,8 @@ def render_segment(spec, start_image, end_image, prompt, seed, prefix):
     if spec["prompt"] is not None and prompt is not None:
         g[spec["prompt"]]["inputs"][spec["prompt_key"]] = prompt
 
-    if seed is not None:
-        for node in g.values():
-            inputs = node.get("inputs", {})
-            for key in SEED_KEYS:
-                if key in inputs and not is_link(inputs[key]):
-                    try:
-                        int(inputs[key])
-                    except (TypeError, ValueError):
-                        continue
-                    inputs[key] = int(seed)
+    _apply_seed(g, seed)
+    apply_videospec_overrides(g, overrides)
 
     out = g[spec["out"]]
     if "filename_prefix" in out.get("inputs", {}):
@@ -472,3 +516,111 @@ def render_segment(spec, start_image, end_image, prompt, seed, prefix):
     if "save_output" in out.get("inputs", {}):
         out["inputs"]["save_output"] = True
     return g
+
+
+# ---------------------------------------------------------------------------
+# Story: шаблон ключевого кадра (T2I) и извлечение Сценариста
+# ---------------------------------------------------------------------------
+
+def prepare_keyframe_template(graph):
+    """Валидация T2I-шаблона ключевого кадра Сценариста.
+
+    Маркеры: GPURAID:PROMPT (нода с текстовым виджетом; без маркера —
+    единственный CLIPTextEncode с литеральным text), GPURAID:KEYFRAME_OUT
+    (SaveImage; без маркера — единственный SaveImage). Save-нода заменяется
+    синтетической с фиксированным id (как в stripe) и PREFIX_PH.
+    """
+    g = copy.deepcopy(graph)
+    for nid, node in g.items():
+        if node.get("class_type") in GPURAID_CLASSES:
+            raise RewriteError(
+                f"Уберите ноду {node.get('class_type')} из шаблона ключевого кадра")
+
+    prompt_id = _find_titled(g, LV_PROMPT)
+    if prompt_id is None:
+        cands = [nid for nid in find_by_class(g, "CLIPTextEncode")
+                 if isinstance(g[nid].get("inputs", {}).get("text"), str)]
+        if len(cands) == 1:
+            prompt_id = cands[0]
+        else:
+            raise RewriteError(
+                'Пометьте ноду промпта кадра заголовком "GPURAID:PROMPT" '
+                f"(кандидатов CLIPTextEncode: {len(cands)})"
+            )
+    prompt_key = None
+    inputs = g[prompt_id].get("inputs", {})
+    for key in TEXT_KEYS:
+        if key in inputs and isinstance(inputs[key], str):
+            prompt_key = key
+            break
+    if prompt_key is None:
+        for key, value in inputs.items():
+            if isinstance(value, str) and not is_link(value):
+                prompt_key = key
+                break
+    if prompt_key is None:
+        raise RewriteError("У ноды GPURAID:PROMPT нет текстового виджета")
+
+    out_id = _find_titled(g, LV_KEYFRAME_OUT)
+    if out_id is None:
+        outs = find_by_class(g, "SaveImage") + find_by_class(g, "PreviewImage")
+        if len(outs) == 1:
+            out_id = outs[0]
+        else:
+            raise RewriteError(
+                'Пометьте Save/Preview-ноду кадра заголовком "GPURAID:KEYFRAME_OUT" '
+                f"(найдено кандидатов: {len(outs)})"
+            )
+    images_in = g[out_id].get("inputs", {}).get("images")
+    if not is_link(images_in):
+        raise RewriteError("У ноды вывода кадра не подключён вход images")
+    g.pop(out_id)
+    g[SAVE_NODE_ID] = {
+        "class_type": "SaveImage",
+        "inputs": {"images": images_in, "filename_prefix": PREFIX_PH},
+    }
+    return {"template": g, "prompt": prompt_id, "prompt_key": prompt_key,
+            "job_type": "image"}
+
+
+def render_keyframe(spec, prompt, seed, width, height, prefix):
+    """Граф одного ключевого кадра: промпт + сид + размер канвы + префикс.
+
+    Размер пишется в Empty*Latent*-ноды (EmptyLatentImage, EmptySD3LatentImage…)
+    — кадр обязан рендериться ровно в WxH сегмента, иначе H3 скомпонует
+    first_frame (stretch) и last_frame (cover) по-разному и стык будет виден.
+    """
+    g = copy.deepcopy(spec["template"])
+    g[spec["prompt"]]["inputs"][spec["prompt_key"]] = prompt
+    _apply_seed(g, seed)
+    for node in g.values():
+        ct = str(node.get("class_type", "")).lower()
+        if "empty" in ct and "latent" in ct:
+            inputs = node.get("inputs", {})
+            if "width" in inputs and not is_link(inputs["width"]):
+                inputs["width"] = int(width)
+            if "height" in inputs and not is_link(inputs["height"]):
+                inputs["height"] = int(height)
+    g[SAVE_NODE_ID]["inputs"]["filename_prefix"] = prefix
+    return g
+
+
+def extract_story_director(graph):
+    """Достаёт параметры из ноды Сценариста; возвращает (params|None, граф без неё)."""
+    g = copy.deepcopy(graph)
+    ids = find_by_class(g, NODE_STORY_DIRECTOR)
+    if not ids:
+        return None, g
+    if len(ids) > 1:
+        raise RewriteError("Нужна одна нода Сценариста (найдено несколько)")
+    nid = ids[0]
+    inputs = g[nid].get("inputs", {})
+    params = {}
+    for key in ("story", "label", "segments_count", "segment_duration_s", "fps",
+                "aspect", "short_edge", "snap", "use_llm", "seed"):
+        value = inputs.get(key)
+        if value is not None and not is_link(value):
+            params[key] = value
+    _replace_links_to(g, nid, {0: str(params.get("story") or "")})
+    g.pop(nid)
+    return params, g
