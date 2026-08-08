@@ -2,7 +2,8 @@
 параллельно) -> сегменты FLF2V (параллельно) -> одно видео.
 
 Строится поверх подсистемы Long Video: тот же манифест (schema 2), тот же
-каталог проектов output/gpuraid/<label>/, тот же редактор в панели. N сегментов
+каталог проектов output/gpuraid/<label>/, тот же редактор (он живёт в ноде
+Сценариста на канве, см. web/lib/editor.js). N сегментов
 = N+1 ключевых кадров; кадр i — конец сегмента i-1 и начало сегмента i, поэтому
 кадры рендерятся ровно в WxH канвы сегментов (иначе H3 скомпонует stretch/cover
 по-разному и стык будет виден).
@@ -65,7 +66,7 @@ def _kf_spec_from_manifest(manifest):
     template = manifest.get("keyframe_template")
     if not template:
         raise RewriteError("У проекта нет шаблона ключевых кадров — задайте его "
-                           "(панель → Сценарист → «Шаблон кадра из канвы»)")
+                           "(нода Сценариста → «Шаблон кадра из канвы»)")
     spec = dict(manifest.get("keyframe_meta") or {})
     spec["template"] = template
     spec["job_type"] = "image"
@@ -127,7 +128,7 @@ async def plan(graph, params, keyframe_graph, client_id):
 
     story_text = str(p.get("story") or "").strip()
     if not story_text:
-        raise RewriteError("Пустой сюжет: заполните story в ноде Сценариста или в панели")
+        raise RewriteError("Пустой сюжет: заполните поле story в ноде Сценариста")
 
     spec = prepare_segment_template(seg_graph)
     if spec["end"] is None:
@@ -164,7 +165,7 @@ async def plan(graph, params, keyframe_graph, client_id):
         except Exception as e:
             llm_meta = {"used": False, "model": "", "error": str(e)}
             events.toast("warn", f"Сценарист: LLM недоступен ({e}) — "
-                                 "разбиваю эвристикой, промпты правьте в панели")
+                                 "разбиваю эвристикой, промпты правьте в ноде")
     if plan_data is None:
         plan_data = storyplan.heuristic_split(story_text,
                                               int(p.get("segments_count") or 0))
@@ -183,7 +184,7 @@ async def plan(graph, params, keyframe_graph, client_id):
     lv.save_manifest(manifest)
     events.toast("success",
                  f"Сценарист: план «{label}» готов — {len(manifest['segments'])} сегментов, "
-                 f"{len(manifest['keyframes'])} кадров. Правьте в панели GPU RAID.")
+                 f"{len(manifest['keyframes'])} кадров. Правьте в ноде Сценариста.")
     return manifest
 
 

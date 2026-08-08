@@ -1,8 +1,14 @@
 // GPU RAID — входной модуль расширения: настройки, перехват Queue, sidebar, события.
+//
+// Разделение труда в UI: рабочая область (канва) — ноды-пульты с раскадровкой,
+// промптами, кадрами и запуском (web/lib/nodeui.js); левая панель — воркеры,
+// настройки и мониторинг (web/lib/panel.js).
 import { app } from "../../scripts/app.js";
 import { api } from "../../scripts/api.js";
 import { gr, toast, clientId } from "./lib/api.js";
 import { GPURaidPanel } from "./lib/panel.js";
+import { broadcast } from "./lib/editor.js";
+import { NODE_LV, NODE_OFFLOAD, NODE_PIPELINE, NODE_STORY } from "./lib/nodeui.js";
 
 let panel = null;
 
@@ -36,13 +42,26 @@ function graphHasStripe(output) {
     return false;
 }
 
-function graphHasStory(output) {
-    if (!output) return false;
-    for (const node of Object.values(output)) {
-        if (node.class_type === "GPURAID_StoryDirector") return true;
+/** Нода-пульт класса cls, у которой не снят on_queue (и которая уедет в prompt). */
+function armedNode(output, cls) {
+    for (const [id, node] of Object.entries(output || {})) {
+        if (node.class_type !== cls) continue;
+        if (node.inputs && node.inputs.on_queue === false) continue;
+        const live = app.graph?.getNodeById?.(Number(id));
+        if (live) return live;
     }
-    return false;
+    return null;
 }
+
+// приоритет, если на канве armed сразу несколько пультов
+const PULTS = [
+    [NODE_STORY, "Сценарист"],
+    [NODE_PIPELINE, "Конвейер"],
+    [NODE_OFFLOAD, "Выполнить на воркере"],
+    [NODE_LV, "Длинное видео"],
+];
+
+const NOOP_QUEUE = { prompt_id: "", number: -1, node_errors: {} };
 
 function hookQueue() {
     const original = api.queuePrompt.bind(api);
@@ -50,21 +69,24 @@ function hookQueue() {
         try {
             if (!setting("GPURaid.Enabled", true)) return original(number, data, ...rest);
             const output = data?.output;
-            if (graphHasStory(output) && !graphHasStripe(output)) {
-                // Сценарист: Queue = «составить план», рендер запускается из панели.
-                // Локальный прогон FLF2V-шаблона с кадрами-заглушками бессмыслен,
-                // поэтому при ошибке валидации показываем причину и НЕ запускаем.
-                try {
-                    const r = await gr.post("/story/plan", {
-                        graph: output, client_id: clientId(),
-                    });
-                    toast("info", "Сценарист: план готов",
-                        `«${r.label}» — панель GPU RAID → Long Video → Редактор`);
-                } catch (e) {
-                    toast(e.status === 409 ? "warn" : "error", "Сценарист", e.message, 8000);
+
+            // 1) ноды-пульты: Queue = «сделай то, что написано на кнопке ноды»
+            const armed = PULTS
+                .map(([cls, title]) => [armedNode(output, cls), title])
+                .filter(([node]) => node);
+            if (armed.length) {
+                const [node, title] = armed[0];
+                if (armed.length > 1) {
+                    toast("warn", `GPU RAID: активных пультов несколько — выполняю «${title}»`,
+                        armed.map(([, t]) => t).join(", ")
+                        + ". Снимите on_queue у лишних нод.", 8000);
                 }
-                return { prompt_id: "", number: -1, node_errors: {} };
+                if (!node.__gr?.run) return original(number, data, ...rest);
+                await node.__gr.run();
+                return NOOP_QUEUE;
             }
+
+            // 2) страйпинг: Distributor+Collector в графе
             if (!graphHasStripe(output)) return original(number, data, ...rest);
             try {
                 const r = await gr.post("/stripe", {
@@ -93,54 +115,6 @@ function hookQueue() {
     };
 }
 
-async function offloadDialog() {
-    let workers = [];
-    try {
-        const r = await gr.get("/workers");
-        workers = (r.workers || []).filter((w) => w.enabled && w.id !== "local");
-    } catch (e) {
-        toast("error", "GPU RAID", "сервер недоступен");
-        return;
-    }
-    if (!workers.length) {
-        toast("warn", "GPU RAID", "нет включённых удалённых воркеров");
-        return;
-    }
-    const overlay = document.createElement("div");
-    overlay.className = "gr-overlay";
-    const dlg = document.createElement("div");
-    dlg.className = "gr-dialog";
-    dlg.innerHTML = "<div class='gr-subtitle'>Выполнить workflow на воркере</div>";
-    for (const w of workers) {
-        const b = document.createElement("button");
-        b.className = "gr-btn gr-wide";
-        const gpu = w.status?.gpu ? ` — ${w.status.gpu}` : "";
-        b.textContent = `${w.name}${gpu} (${w.status?.state || "?"})`;
-        b.onclick = async () => {
-            overlay.remove();
-            try {
-                const p = await app.graphToPrompt();
-                const r = await gr.post("/offload", {
-                    graph: p.output, workflow_ui: p.workflow,
-                    worker_id: w.id, label: "offload", client_id: clientId(),
-                });
-                toast("info", "GPU RAID: offload запущен", (r.warnings || []).join("; "));
-            } catch (e) {
-                toast("error", "Offload не запущен", e.message);
-            }
-        };
-        dlg.appendChild(b);
-    }
-    const cancel = document.createElement("button");
-    cancel.className = "gr-btn";
-    cancel.textContent = "Отмена";
-    cancel.onclick = () => overlay.remove();
-    dlg.appendChild(cancel);
-    overlay.appendChild(dlg);
-    overlay.onclick = (ev) => { if (ev.target === overlay) overlay.remove(); };
-    document.body.appendChild(overlay);
-}
-
 const EVENTS = ["worker", "unit", "job_started", "job_done", "longvideo"];
 
 app.registerExtension({
@@ -165,16 +139,6 @@ app.registerExtension({
             defaultValue: false,
         },
     ],
-    commands: [
-        {
-            id: "GPURaid.RunOnWorker",
-            label: "GPU RAID: Run on worker…",
-            function: offloadDialog,
-        },
-    ],
-    menuCommands: [
-        { path: ["Extensions", "GPU RAID"], commands: ["GPURaid.RunOnWorker"] },
-    ],
     aboutPageBadges: [
         { label: "GPU RAID", url: "https://github.com/Weloyo/ComfyUI-GPU-RAID", icon: "pi pi-server" },
     ],
@@ -184,6 +148,7 @@ app.registerExtension({
         for (const name of EVENTS) {
             api.addEventListener("gpuraid." + name, (ev) => {
                 try { panel?.onEvent(name, ev.detail); } catch (e) { /* ignore */ }
+                try { broadcast(name, ev.detail); } catch (e) { /* ignore */ }
             });
         }
         api.addEventListener("gpuraid.toast", (ev) => {
@@ -195,7 +160,7 @@ app.registerExtension({
                 id: "gpu-raid",
                 icon: "pi pi-server",
                 title: "GPU RAID",
-                tooltip: "GPU RAID — распределённая генерация",
+                tooltip: "GPU RAID — воркеры, режимы и задания",
                 type: "custom",
                 render: (el) => { panel = new GPURaidPanel(el); },
                 destroy: () => { panel?.dispose(); panel = null; },

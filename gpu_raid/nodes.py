@@ -1,4 +1,11 @@
-"""Ноды GPU RAID: Distributor, Collector, TiledUpscale, VideoSpec, StoryDirector."""
+"""Ноды GPU RAID.
+
+Две группы. «Рабочие» (Distributor/Collector/TiledUpscale/VideoSpec/Save-LoadBundle)
+реально что-то считают и уезжают на воркеров. «Маркеры» (StoryDirector, LongVideo,
+Offload, Pipeline) — пульты управления мастером прямо на канве: они ничего не
+вычисляют, весь их UI живёт во фронтенде (web/lib/nodeui.js), а из любого графа
+перед отправкой они вырезаются (graph_rewrite.strip_markers).
+"""
 
 import logging
 import os
@@ -9,8 +16,9 @@ import uuid
 log = logging.getLogger("gpu_raid")
 
 from .consts import (ASPECTS, NODE_COLLECTOR, NODE_DISTRIBUTOR, NODE_LOAD_BUNDLE,
-                     NODE_SAVE_BUNDLE, NODE_STORY_DIRECTOR, NODE_TILED_UPSCALE,
-                     NODE_VIDEO_SPEC, SAVE_NODE_ID)
+                     NODE_LONG_VIDEO, NODE_OFFLOAD, NODE_PIPELINE, NODE_SAVE_BUNDLE,
+                     NODE_STORY_DIRECTOR, NODE_TILED_UPSCALE, NODE_VIDEO_SPEC,
+                     SAVE_NODE_ID)
 from . import results, storyplan
 
 
@@ -373,11 +381,12 @@ class GPURaidVideoSpec:
 
 
 class GPURaidStoryDirector:
-    """«Сценарист»: маркер-нода с параметрами истории.
+    """«Сценарист»: нода-проект с раскадровкой прямо на канве.
 
-    Сама нода ничего не рендерит: нажатие Queue перехватывается расширением —
-    LLM (или эвристика) разбивает сюжет на сегменты, план появляется в панели
-    GPU RAID (раздел «Сценарист»), где промпты правятся до и после рендера.
+    Сама нода ничего не рендерит: нажатие Queue (или кнопка «План» в теле ноды)
+    перехватывается расширением — LLM (или эвристика) разбивает сюжет на
+    сегменты. Дальше вся работа идёт в самой ноде: лента ключевых кадров с
+    промптами и превью, сегменты с видео, кнопки рендера и экспорта.
     """
 
     CATEGORY = "GPU RAID"
@@ -385,8 +394,9 @@ class GPURaidStoryDirector:
     RETURN_NAMES = ("story",)
     FUNCTION = "run"
     DESCRIPTION = ("Опишите сюжет — Queue разберёт его на сегменты (first/last кадры "
-                   "+ промпт на сегмент, всё редактируется в панели), воркеры "
-                   "отрендерят сегменты параллельно, итог склеится в одно видео.")
+                   "+ промпт на сегмент). Раскадровка, промпты, превью и рендер — "
+                   "в теле самой ноды; воркеры считают сегменты параллельно, "
+                   "итог склеивается в одно видео.")
 
     @classmethod
     def INPUT_TYPES(cls):
@@ -405,11 +415,116 @@ class GPURaidStoryDirector:
                 "snap": (["minimax_h3", "none"], {"default": "minimax_h3"}),
                 "use_llm": ("BOOLEAN", {"default": True}),
                 "seed": ("INT", {"default": 0, "min": 0, "max": 0xFFFFFFFFFFFFFFFF}),
+                "on_queue": ("BOOLEAN", {"default": True,
+                                         "tooltip": "перехватывать Queue: нажатие составляет "
+                                                    "план вместо локального прогона"}),
             }
         }
 
     def run(self, story, **_kw):
         return (str(story or ""),)
+
+
+class GPURaidLongVideo:
+    """«Длинное видео»: нода-проект без LLM — сегменты задаются руками.
+
+    chain — каждый следующий сегмент продолжает последний кадр предыдущего
+    (любая длина, последовательно); keyframes — готовые кадры из input-каталога
+    попарно превращаются в сегменты FLF2V и считаются параллельно.
+    Шаблон сегмента = текущий канвас (маркеры GPURAID:START_IMAGE и т.д.).
+    """
+
+    CATEGORY = "GPU RAID"
+    RETURN_TYPES = ()
+    FUNCTION = "run"
+    DESCRIPTION = ("Сборка длинного видео из сегментов текущего workflow. "
+                   "Промпты, порядок, тримы и перерендер — в теле ноды.")
+
+    @classmethod
+    def INPUT_TYPES(cls):
+        return {
+            "required": {
+                "label": ("STRING", {"default": "myvideo",
+                                     "tooltip": "имя проекта: output/gpuraid/<label>"}),
+                "mode": (["chain", "keyframes"], {"default": "chain"}),
+                "count": ("INT", {"default": 4, "min": 1, "max": 999,
+                                  "tooltip": "сегментов (для chain)"}),
+                "prompts": ("STRING", {"multiline": True, "default": "",
+                                       "tooltip": "по промпту на строку; пусто = промпт из workflow"}),
+                "keyframes": ("STRING", {"multiline": True, "default": "",
+                                         "tooltip": "режим keyframes: имена файлов из input, "
+                                                    "по одному на строку (минимум 2)"}),
+                "seed": ("INT", {"default": 0, "min": 0, "max": 0xFFFFFFFFFFFFFFFF}),
+                "seed_policy": (["increment", "fixed", "random"], {"default": "increment"}),
+                "crossfade_s": ("FLOAT", {"default": 0.0, "min": 0.0, "max": 10.0, "step": 0.1}),
+                "on_queue": ("BOOLEAN", {"default": True,
+                                         "tooltip": "перехватывать Queue: нажатие запускает "
+                                                    "сборку проекта, а не локальный прогон"}),
+            }
+        }
+
+    def run(self, **_kw):
+        return ()
+
+
+class GPURaidOffload:
+    """«Выполнить на воркере»: весь текущий workflow целиком уезжает на одну машину.
+
+    Маркер-нода: выбор воркера и кнопка запуска живут в теле ноды. Из графа,
+    уезжающего на воркера, нода вырезается.
+    """
+
+    CATEGORY = "GPU RAID"
+    RETURN_TYPES = ()
+    FUNCTION = "run"
+    DESCRIPTION = ("Весь workflow считает выбранный воркер, локальная GPU свободна; "
+                   "результаты возвращаются в output/gpuraid/<label>_<время>/.")
+
+    @classmethod
+    def INPUT_TYPES(cls):
+        return {
+            "required": {
+                "worker": ("STRING", {"default": "",
+                                      "tooltip": "id воркера; выбирается списком в теле ноды"}),
+                "label": ("STRING", {"default": "offload"}),
+                "on_queue": ("BOOLEAN", {"default": True,
+                                         "tooltip": "перехватывать Queue: нажатие отправляет "
+                                                    "workflow на воркера"}),
+            }
+        }
+
+    def run(self, **_kw):
+        return ()
+
+
+class GPURaidPipeline:
+    """«Конвейер»: один workflow режется на стадии, стадии считают разные воркеры.
+
+    Маркер-нода: кнопка «Анализ», раскладка стадий по воркерам и запуск живут в
+    теле ноды; выбранная раскладка хранится в свойствах ноды и сохраняется
+    вместе с workflow.
+    """
+
+    CATEGORY = "GPU RAID"
+    RETURN_TYPES = ()
+    FUNCTION = "run"
+    DESCRIPTION = ("Для моделей, которые не влезают целиком ни в один GPU: энкодер / "
+                   "диффузия / VAE разъезжаются по воркерам, промежуточные тензоры "
+                   "едут бандлами. Спец-ноды в графе не нужны.")
+
+    @classmethod
+    def INPUT_TYPES(cls):
+        return {
+            "required": {
+                "label": ("STRING", {"default": "pipeline"}),
+                "on_queue": ("BOOLEAN", {"default": True,
+                                         "tooltip": "перехватывать Queue: нажатие запускает "
+                                                    "конвейер по сохранённой раскладке"}),
+            }
+        }
+
+    def run(self, **_kw):
+        return ()
 
 
 class GPURaidSaveBundle:
@@ -502,6 +617,9 @@ NODE_CLASS_MAPPINGS = {
     NODE_TILED_UPSCALE: GPURaidTiledUpscale,
     NODE_VIDEO_SPEC: GPURaidVideoSpec,
     NODE_STORY_DIRECTOR: GPURaidStoryDirector,
+    NODE_LONG_VIDEO: GPURaidLongVideo,
+    NODE_OFFLOAD: GPURaidOffload,
+    NODE_PIPELINE: GPURaidPipeline,
     NODE_SAVE_BUNDLE: GPURaidSaveBundle,
     NODE_LOAD_BUNDLE: GPURaidLoadBundle,
 }
@@ -511,7 +629,10 @@ NODE_DISPLAY_NAME_MAPPINGS = {
     NODE_COLLECTOR: "GPU RAID Collector",
     NODE_TILED_UPSCALE: "GPU RAID Tiled Upscale",
     NODE_VIDEO_SPEC: "GPU RAID Видео-спека",
-    NODE_STORY_DIRECTOR: "GPU RAID Сценарист",
+    NODE_STORY_DIRECTOR: "GPU RAID Сценарист (раскадровка)",
+    NODE_LONG_VIDEO: "GPU RAID Длинное видео",
+    NODE_OFFLOAD: "GPU RAID Выполнить на воркере",
+    NODE_PIPELINE: "GPU RAID Конвейер (шардинг)",
     NODE_SAVE_BUNDLE: "GPU RAID Save Bundle (шардинг)",
     NODE_LOAD_BUNDLE: "GPU RAID Load Bundle (шардинг)",
 }

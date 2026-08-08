@@ -11,6 +11,7 @@ import copy
 
 from .consts import (
     GPURAID_CLASSES,
+    GPURAID_MARKER_CLASSES,
     INDEX_PH,
     LOADER_TABLE,
     LV_END,
@@ -107,6 +108,30 @@ def _literal_int(node, key, what):
         return int(value)
     except (TypeError, ValueError):
         raise RewriteError(f"{what}: не удалось прочитать число (получено {value!r})")
+
+
+def strip_markers(graph, in_place=False):
+    """Убирает ноды-пульты мастера (Сценарист, Длинное видео, Offload, Конвейер).
+
+    Они ничего не вычисляют и не должны попадать ни в шаблоны сегментов/кадров,
+    ни на воркеров — только на канвас пользователя. Единственный выход среди
+    них — story у Сценариста: он литерализуется у потребителей.
+    """
+    g = graph if in_place else copy.deepcopy(graph)
+    for ct in GPURAID_MARKER_CLASSES:
+        for nid in find_by_class(g, ct):
+            if ct == NODE_STORY_DIRECTOR:
+                story = g[nid].get("inputs", {}).get("story", "")
+                if is_link(story):
+                    story = ""
+                _replace_links_to(g, nid, {0: str(story or "")})
+            g.pop(nid)
+    return g
+
+
+def markers_in(graph):
+    """Список class_type присутствующих в графе нод-пультов (для предупреждений)."""
+    return [ct for ct in GPURAID_MARKER_CLASSES if find_by_class(graph, ct)]
 
 
 # ---------------------------------------------------------------------------
@@ -264,13 +289,10 @@ def splice_gpuraid(graph):
             warnings.append("GPU RAID Tiled Upscale пропущен на воркере (изображение передано без апскейла)")
         g.pop(t_id)
 
-    for s_id in find_by_class(g, NODE_STORY_DIRECTOR):
-        story = g[s_id].get("inputs", {}).get("story", "")
-        if is_link(story):
-            story = ""
-        _replace_links_to(g, s_id, {0: str(story or "")})
-        g.pop(s_id)
-        warnings.append("Сценарист вырезан (это маркер-нода мастера)")
+    present = markers_in(g)
+    if present:
+        strip_markers(g, in_place=True)
+        warnings.append("Ноды-пульты мастера вырезаны: " + ", ".join(present))
 
     # подчистка повисших ссылок (потребители удалённых нод с value None)
     for nid, node in g.items():
@@ -393,12 +415,14 @@ def prepare_segment_template(graph):
       GPURAID:PROMPT      — нода с текстовым виджетом (опционально)
       GPURAID:VIDEO_OUT   — нода сохранения видео (иначе автоопределение)
     """
-    g = copy.deepcopy(graph)
-    for ct in (NODE_DISTRIBUTOR, NODE_COLLECTOR, NODE_STORY_DIRECTOR):
+    # ноды-пульты (Сценарист, Длинное видео, Offload, Конвейер) живут на той же
+    # канве, что и шаблон, — просто вырезаем их
+    g = strip_markers(graph)
+    for ct in (NODE_DISTRIBUTOR, NODE_COLLECTOR):
         if find_by_class(g, ct):
             raise RewriteError(
-                "Уберите ноды Distributor/Collector/Сценарист из шаблона сегмента "
-                "(Сценарист вырезается автоматически при запуске через Queue/панель)"
+                "Уберите ноды Distributor/Collector из шаблона сегмента: "
+                "страйпинг и сборка длинного видео — разные режимы"
             )
 
     start_id = _find_titled(g, LV_START)
@@ -530,7 +554,7 @@ def prepare_keyframe_template(graph):
     (SaveImage; без маркера — единственный SaveImage). Save-нода заменяется
     синтетической с фиксированным id (как в stripe) и PREFIX_PH.
     """
-    g = copy.deepcopy(graph)
+    g = strip_markers(graph)
     for nid, node in g.items():
         if node.get("class_type") in GPURAID_CLASSES:
             raise RewriteError(
@@ -610,7 +634,7 @@ def extract_story_director(graph):
     g = copy.deepcopy(graph)
     ids = find_by_class(g, NODE_STORY_DIRECTOR)
     if not ids:
-        return None, g
+        return None, strip_markers(g, in_place=True)
     if len(ids) > 1:
         raise RewriteError("Нужна одна нода Сценариста (найдено несколько)")
     nid = ids[0]
@@ -623,4 +647,4 @@ def extract_story_director(graph):
             params[key] = value
     _replace_links_to(g, nid, {0: str(params.get("story") or "")})
     g.pop(nid)
-    return params, g
+    return params, strip_markers(g, in_place=True)

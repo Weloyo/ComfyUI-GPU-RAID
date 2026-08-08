@@ -22,6 +22,7 @@ from gpu_raid.graph_rewrite import (
     render_unit,
     splice_gpuraid,
     strip_annotation,
+    strip_markers,
     validate_stripe,
 )
 
@@ -278,13 +279,22 @@ def test_render_keyframe():
     assert spec["template"]["2"]["inputs"]["width"] == 512
 
 
-def test_keyframe_template_rejects_gpuraid_nodes():
+def test_keyframe_template_strips_markers_rejects_workers_nodes():
+    # ноды-пульты живут на той же канве — вырезаются молча
     g = kf_graph()
     g["3"]["_meta"] = {"title": "GPURAID:PROMPT"}
     g["99"] = {"class_type": "GPURAID_StoryDirector", "inputs": {"story": "x"}}
+    g["98"] = {"class_type": "GPURAID_Offload", "inputs": {"worker": "w1"}}
+    spec = prepare_keyframe_template(g)
+    assert "99" not in spec["template"] and "98" not in spec["template"]
+
+    # а вот рабочая нода страйпинга в шаблоне кадра — ошибка
+    g2 = kf_graph()
+    g2["3"]["_meta"] = {"title": "GPURAID:PROMPT"}
+    g2["97"] = {"class_type": "GPURAID_Collector", "inputs": {"images": ["3", 0]}}
     try:
-        prepare_keyframe_template(g)
-        assert False, "GPURAID-нода в шаблоне кадра — должно падать"
+        prepare_keyframe_template(g2)
+        assert False, "Collector в шаблоне кадра — должно падать"
     except RewriteError:
         pass
 
@@ -318,17 +328,33 @@ def test_extract_story_director():
         pass
 
 
-def test_segment_template_rejects_director_but_extract_first_works():
-    # prepare_segment_template должен падать, пока Сценарист в графе...
-    try:
-        prepare_segment_template(story_graph())
-        assert False, "Сценарист в шаблоне — должно падать"
-    except RewriteError:
-        pass
-    # ...а после извлечения — работать
-    _, g = extract_story_director(story_graph())
+def test_segment_template_strips_markers_rejects_stripe_nodes():
+    # пульты на канве (Сценарист, Конвейер) шаблону сегмента не мешают
+    g = story_graph()
+    g["51"] = {"class_type": "GPURAID_Pipeline", "inputs": {"label": "p"}}
     spec = prepare_segment_template(g)
     assert spec["start"] == "1" and spec["end"] == "2"
+    assert "50" not in spec["template"] and "51" not in spec["template"]
+
+    # а Distributor/Collector — разные режимы, это ошибка
+    g2 = story_graph()
+    g2["52"] = {"class_type": "GPURAID_Collector", "inputs": {"images": ["3", 0]}}
+    try:
+        prepare_segment_template(g2)
+        assert False, "Collector в шаблоне сегмента — должно падать"
+    except RewriteError:
+        pass
+
+
+def test_strip_markers_literalizes_story_and_drops_pults():
+    g = story_graph()
+    g["51"] = {"class_type": "GPURAID_Offload", "inputs": {"worker": "w1"}}
+    g["52"] = {"class_type": "GPURAID_LongVideo", "inputs": {"label": "v"}}
+    g["53"] = {"class_type": "ShowText", "inputs": {"text": ["50", 0]}}
+    out = strip_markers(g)
+    assert not any(k in out for k in ("50", "51", "52"))
+    assert out["53"]["inputs"]["text"] == "Лодка уходит в шторм."
+    assert "50" in g, "исходный граф не должен меняться без in_place"
 
 
 def test_videospec_overrides_and_segment_render():
@@ -358,4 +384,4 @@ def test_videospec_overrides_and_segment_render():
 def test_splice_removes_story_director():
     g, warnings = splice_gpuraid(story_graph())
     assert "50" not in g
-    assert any("Сценарист" in w for w in warnings)
+    assert any("GPURAID_StoryDirector" in w for w in warnings)

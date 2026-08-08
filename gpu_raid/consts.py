@@ -23,11 +23,20 @@ NODE_DISTRIBUTOR = "GPURAID_Distributor"
 NODE_COLLECTOR = "GPURAID_Collector"
 NODE_TILED_UPSCALE = "GPURAID_TiledUpscale"
 NODE_STORY_DIRECTOR = "GPURAID_StoryDirector"
+NODE_LONG_VIDEO = "GPURAID_LongVideo"
+NODE_OFFLOAD = "GPURAID_Offload"
+NODE_PIPELINE = "GPURAID_Pipeline"
 NODE_VIDEO_SPEC = "GPURAID_VideoSpec"       # НЕ в GPURAID_CLASSES: выполняется и на воркерах
 NODE_SAVE_BUNDLE = "GPURAID_SaveBundle"     # тоже выполняются на воркерах (шардинг)
 NODE_LOAD_BUNDLE = "GPURAID_LoadBundle"
-GPURAID_CLASSES = (NODE_DISTRIBUTOR, NODE_COLLECTOR, NODE_TILED_UPSCALE,
-                   NODE_STORY_DIRECTOR)
+
+# «Маркеры» — ноды-пульты мастера: ничего не вычисляют, живут только на канве и
+# вырезаются из ЛЮБОГО графа перед отправкой куда бы то ни было. Сценарист
+# отдаёт наружу текст сюжета, остальные вообще без выходов.
+GPURAID_MARKER_CLASSES = (NODE_STORY_DIRECTOR, NODE_LONG_VIDEO, NODE_OFFLOAD,
+                          NODE_PIPELINE)
+GPURAID_CLASSES = (NODE_DISTRIBUTOR, NODE_COLLECTOR, NODE_TILED_UPSCALE
+                   ) + GPURAID_MARKER_CLASSES
 
 # --- плейсхолдеры юнит-шаблона ---
 SEED_PH = "__GPURAID_SEED__"

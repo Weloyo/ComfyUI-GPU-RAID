@@ -18,7 +18,8 @@ import folder_paths
 
 from . import events, pipeline_split as ps
 from .dispatcher import DEAD, DONE, MANAGER, Job, Unit, UnitCancelled, UnitFailure
-from .graph_rewrite import RewriteError, classify_job_type, collect_upload_refs
+from .graph_rewrite import (RewriteError, classify_job_type, collect_upload_refs,
+                            strip_markers)
 from .workers import LOCAL_ID, REGISTRY
 
 log = logging.getLogger("gpu_raid")
@@ -92,6 +93,7 @@ def _online_workers():
 
 
 async def analyze(graph):
+    graph = strip_markers(graph)   # нода «Конвейер» сама живёт на этой же канве
     part = ps.partition(graph, _type_table())
     sizes = _model_sizes(graph)
     workers = _online_workers()
@@ -131,6 +133,7 @@ async def analyze(graph):
 
 
 async def start(graph, workflow_ui, placement, label, client_id):
+    graph = strip_markers(graph)
     part = ps.partition(graph, _type_table())
     if placement:
         placement = {int(k): str(v) for k, v in placement.items()}
