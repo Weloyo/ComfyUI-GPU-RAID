@@ -80,13 +80,25 @@ PROVIDERS = (
         "optional": True,
         "fallback": "без него Kaggle-ноутбук запускается вручную",
         "links": [
-            {"label": "Скачать kaggle.json (Settings → API → Create New Token)",
-             "url": "https://www.kaggle.com/settings/account"},
+            {"label": "Настройки Kaggle → секция API → «Create New Token»",
+             "url": "https://www.kaggle.com/settings"},
+        ],
+        "steps": [
+            "Пролистайте до секции API и нажмите «Create New Token».",
+            "Новый Kaggle показывает строку KGAT_… в окне «API Token is now "
+            "available» — скопируйте её (второй раз её не покажут). Старый "
+            "скачивал файл kaggle.json — тогда откройте файл блокнотом и "
+            "скопируйте строку целиком.",
+            "Вставьте скопированное в поле «токен» ниже и впишите своё имя "
+            "аккаунта Kaggle — из токена оно не читается, а без него не "
+            "собрать адрес кернела.",
         ],
         "fields": [
-            {"key": "kaggle_json", "label": "kaggle.json", "secret": True,
+            {"key": "username", "label": "аккаунт", "secret": False,
+             "placeholder": "ваш логин на kaggle.com"},
+            {"key": "kaggle_json", "label": "токен", "secret": True,
              "multiline": True,
-             "placeholder": '{"username":"…","key":"…"} — содержимое скачанного файла'},
+             "placeholder": 'KGAT_… либо содержимое старого kaggle.json'},
         ],
         "actions": [
             {"id": "install_cli", "label": "Установить kaggle CLI",
@@ -171,27 +183,91 @@ def _kaggle_creds():
     return data.get("username") or None, data.get("key") or None
 
 
-def parse_kaggle_json(text):
-    """Разбирает содержимое kaggle.json, поднимая понятную ошибку.
+def kaggle_username(settings=None):
+    """Имя аккаунта: из kaggle.json (старая схема) или из настроек (новая)."""
+    user, _ = _kaggle_creds()
+    if user:
+        return user
+    if settings is None:
+        from .workers import REGISTRY
 
-    Чистая функция: пользователь вполне может вставить сюда что угодно.
+        settings = REGISTRY.settings()
+    return str((settings.get("kaggle") or {}).get("username") or "")
+
+
+TOKEN_PREFIX = "KGAT_"
+
+
+def parse_kaggle_credentials(text):
+    """Разбирает то, что дал Kaggle, — в двух форматах сразу.
+
+    Старый: файл kaggle.json c {"username","key"} (CLI берёт его через
+    KAGGLE_CONFIG_DIR). Новый (с 2026): одна строка KGAT_… для переменной
+    KAGGLE_API_TOKEN, имени аккаунта в ней нет — его спрашиваем отдельно.
+
+    Возвращает {"kind": "json"|"token", ...}. Чистая функция: пользователь
+    вполне может вставить сюда что угодно.
     """
-    text = str(text or "").strip()
+    # люди копируют по-разному: с кавычками, с пробелами, с хвостом строки
+    text = str(text or "").strip().strip('"\'').strip()
     if not text:
         raise ValueError("пусто")
+    if text.startswith(TOKEN_PREFIX):
+        token = text.split()[0].strip().strip('"\'')
+        if len(token) <= len(TOKEN_PREFIX):
+            raise ValueError("токен обрезан — скопируйте строку KGAT_… целиком")
+        return {"kind": "token", "token": token}
+    if not text.lstrip().startswith("{"):
+        raise ValueError(
+            "не похоже ни на kaggle.json, ни на токен: вставьте либо строку "
+            "KGAT_… из окна «API Token is now available», либо содержимое "
+            "старого файла kaggle.json"
+        )
     try:
         data = json.loads(text)
     except Exception:
         raise ValueError("это не JSON — вставьте содержимое файла kaggle.json целиком")
     if not isinstance(data, dict) or not data.get("username") or not data.get("key"):
         raise ValueError('в JSON нет полей "username" и "key"')
-    return {"username": str(data["username"]), "key": str(data["key"])}
+    return {"kind": "json", "username": str(data["username"]), "key": str(data["key"])}
+
+
+# совместимость со старым именем (и старыми тестами)
+def parse_kaggle_json(text):
+    creds = parse_kaggle_credentials(text)
+    if creds["kind"] != "json":
+        raise ValueError("это токен новой схемы, а не kaggle.json")
+    return {"username": creds["username"], "key": creds["key"]}
+
+
+def kaggle_cli_path():
+    """Путь к kaggle CLI.
+
+    По PATH искать бесполезно: pip кладёт его в Scripts/ питона мастера, а у
+    портабла эта папка в PATH процесса не попадает. Поэтому смотрим рядом с
+    интерпретатором, которым нас запустили.
+    """
+    import os
+    import shutil
+    import sysconfig
+
+    found = shutil.which("kaggle")
+    if found:
+        return found
+    names = ("kaggle.exe", "kaggle") if sys.platform == "win32" else ("kaggle",)
+    dirs = [sysconfig.get_path("scripts"),
+            os.path.join(os.path.dirname(sys.executable), "Scripts"),
+            os.path.join(os.path.dirname(sys.executable), "bin")]
+    for d in dirs:
+        for name in names:
+            path = os.path.join(d or "", name)
+            if os.path.isfile(path):
+                return path
+    return ""
 
 
 def kaggle_cli_present():
-    import shutil
-
-    return bool(shutil.which("kaggle"))
+    return bool(kaggle_cli_path())
 
 
 def configured(pid, settings, secrets_view):
@@ -201,7 +277,8 @@ def configured(pid, settings, secrets_view):
     if pid == "github":
         return bool(secrets_view.get("has_gh_token"))
     if pid == "kaggle":
-        return bool(secrets_view.get("has_kaggle_json"))
+        return bool(secrets_view.get("has_kaggle_json")
+                    or secrets_view.get("has_kaggle_token"))
     if pid == "huggingface":
         return bool(secrets_view.get("has_hf_token"))
     if pid == "civitai":
@@ -216,11 +293,10 @@ def status_view(settings, secrets_view):
     checks = settings.get("connections") or {}
     llm = settings.get("llm") or {}
     rdv = settings.get("rendezvous") or {}
-    kaggle_user, _ = _kaggle_creds()
     values = {
         "llm": {"base_url": llm.get("base_url", ""), "model": llm.get("model", "")},
         "github": {"gist_id": rdv.get("gist_id", "")},
-        "kaggle": {"username": kaggle_user or ""},
+        "kaggle": {"username": kaggle_username(settings)},
     }
     out = []
     for p in PROVIDERS:
@@ -279,9 +355,16 @@ async def save(pid, payload):
         if given("gist_id"):
             settings_patch["rendezvous"] = {"gist_id": _gist_id(payload["gist_id"])}
     elif pid == "kaggle":
+        if given("username"):
+            settings_patch["kaggle"] = {"username": str(payload["username"]).strip()}
         if given("kaggle_json") and str(payload["kaggle_json"]).strip():
-            creds = parse_kaggle_json(payload["kaggle_json"])
-            _secrets().save_kaggle_json(json.dumps(creds))
+            creds = parse_kaggle_credentials(payload["kaggle_json"])
+            if creds["kind"] == "json":
+                _secrets().save_kaggle_json(json.dumps(
+                    {"username": creds["username"], "key": creds["key"]}))
+                settings_patch.setdefault("kaggle", {})["username"] = creds["username"]
+            else:
+                sec["kaggle_token"] = creds["token"]
     elif pid == "huggingface":
         if given("hf_token") and str(payload["hf_token"]).strip():
             sec["hf_token"] = str(payload["hf_token"]).strip()
@@ -299,6 +382,7 @@ async def save(pid, payload):
 SECRET_KEYS = {
     "llm": ("llm_api_key",),
     "github": ("gh_token",),
+    "kaggle": ("kaggle_token",),
     "huggingface": ("hf_token",),
     "civitai": ("civitai_token",),
 }
@@ -314,6 +398,7 @@ async def forget(pid):
         _secrets().save({k: "" for k in keys})   # пустое значение удаляет секрет
     if pid == "kaggle":
         _secrets().save_kaggle_json("")
+        await REGISTRY.update_settings({"kaggle": {"username": ""}})
     if pid == "github":
         await REGISTRY.update_settings({"rendezvous": {"gist_id": ""}})
     if pid == "llm":
@@ -480,25 +565,49 @@ async def create_gist():
 
 
 async def _check_kaggle():
-    user, key = _kaggle_creds()
-    if not user or not key:
-        return False, "kaggle.json не сохранён", {}
-    import aiohttp
+    """Две схемы: старый kaggle.json (проверяем по HTTP) и новый токен KGAT_…
 
-    auth = aiohttp.BasicAuth(user, key)
-    async with _session() as s:
-        async with s.get("https://www.kaggle.com/api/v1/kernels/list",
-                         params={"mine": "true", "pageSize": "1"}, auth=auth) as r:
-            if r.status in (401, 403):
-                return False, f"{r.status} — ключ неверен или отозван", {}
-            if r.status != 200:
-                return False, f"HTTP {r.status}", {}
+    У нового токена единственный документированный потребитель — сам kaggle CLI
+    (переменная KAGGLE_API_TOKEN), поэтому и проверяем им же: он нам всё равно
+    нужен, чтобы пушить кернел.
+    """
+    from . import kaggle_api
+
+    legacy_user, legacy_key = _kaggle_creds()
+    token = _secrets().get("kaggle_token")
+    if not legacy_key and not token:
+        return False, "токен не сохранён", {}
+    user = kaggle_username()
+    if not user:
+        return (False, "впишите имя аккаунта Kaggle — из токена KGAT_… оно не "
+                "читается, а без него не собрать адрес кернела", {})
     cli = kaggle_cli_present()
+
+    if legacy_key:
+        import aiohttp
+
+        async with _session() as s:
+            async with s.get("https://www.kaggle.com/api/v1/kernels/list",
+                             params={"mine": "true", "pageSize": "1"},
+                             auth=aiohttp.BasicAuth(legacy_user, legacy_key)) as r:
+                if r.status in (401, 403):
+                    return False, f"{r.status} — ключ неверен или отозван", {}
+                if r.status != 200:
+                    return False, f"HTTP {r.status}", {}
+        if not cli:
+            return (False, f"ключ работает (аккаунт {user}) — остался один шаг: "
+                    "нажмите «Установить kaggle CLI»",
+                    {"username": user, "cli": False, "pending": "install_cli"})
+        return True, f"аккаунт {user} (схема kaggle.json)", {"username": user, "cli": True}
+
     if not cli:
-        return (False, f"ключ работает (аккаунт {user}) — остался один шаг: "
-                "нажмите «Установить kaggle CLI»",
+        return (False, "токен сохранён — остался один шаг: «Установить kaggle CLI». "
+                "Новая схема Kaggle проверяется только через него",
                 {"username": user, "cli": False, "pending": "install_cli"})
-    return True, f"аккаунт {user}", {"username": user, "cli": True}
+    ok, text = await kaggle_api.check_cli()
+    if not ok:
+        return False, f"kaggle CLI не принял токен: {text[:200]}", {"username": user}
+    return True, f"аккаунт {user} (токен KGAT)", {"username": user, "cli": True}
 
 
 async def install_kaggle_cli():

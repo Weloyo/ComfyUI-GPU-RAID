@@ -120,7 +120,8 @@ async def settings_get(request):
 
 
 _SETTINGS_KEYS = ("lifecycle", "llm", "rendezvous", "timeouts", "connections",
-                  "max_retries", "keep_last_jobs", "heartbeat_s", "free_after_job")
+                  "kaggle", "max_retries", "keep_last_jobs", "heartbeat_s",
+                  "free_after_job")
 
 
 @routes.patch("/gpuraid/settings")

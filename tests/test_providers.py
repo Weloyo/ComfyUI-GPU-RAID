@@ -42,18 +42,34 @@ def test_every_secret_field_can_be_forgotten():
         assert p["id"] in providers.SECRET_KEYS or p["id"] == "kaggle", p["id"]
 
 
-def test_parse_kaggle_json_ok():
-    creds = providers.parse_kaggle_json('{"username": "weloyo", "key": "abc123"}')
-    assert creds == {"username": "weloyo", "key": "abc123"}
+def test_parse_kaggle_legacy_json():
+    creds = providers.parse_kaggle_credentials('{"username": "weloyo", "key": "abc123"}')
+    assert creds == {"kind": "json", "username": "weloyo", "key": "abc123"}
+    assert providers.parse_kaggle_json('{"username": "weloyo", "key": "abc123"}') \
+        == {"username": "weloyo", "key": "abc123"}
 
 
-def test_parse_kaggle_json_errors():
-    for bad, hint in [("", "пусто"), ("не json", "JSON"),
+def test_parse_kaggle_new_token():
+    # Kaggle с 2026 отдаёт одну строку KGAT_… вместо файла kaggle.json
+    creds = providers.parse_kaggle_credentials("  KGAT_deadbeef1234  ")
+    assert creds == {"kind": "token", "token": "KGAT_deadbeef1234"}
+    # лишние кавычки и хвост после пробела отрезаем — люди копируют по-разному
+    assert providers.parse_kaggle_credentials('"KGAT_abc" ')["token"] == "KGAT_abc"
+    try:
+        providers.parse_kaggle_credentials("KGAT_")
+        assert False, "обрезанный токен должен падать"
+    except ValueError as e:
+        assert "целиком" in str(e)
+
+
+def test_parse_kaggle_errors():
+    for bad, hint in [("", "пусто"), ("не json", "KGAT_"),
                       ('{"username": "x"}', "username"),
                       ('{"key": "x"}', "username"),
-                      ('["x"]', "username")]:
+                      ('["x"]', "KGAT_"),          # не объект и не токен
+                      ('{сломанный', "не JSON")]:
         try:
-            providers.parse_kaggle_json(bad)
+            providers.parse_kaggle_credentials(bad)
             assert False, f"должно падать: {bad!r}"
         except ValueError as e:
             assert hint in str(e), (bad, str(e))
@@ -67,6 +83,14 @@ def test_gist_id_from_url_or_raw():
     assert providers._gist_id(f"https://gist.github.com/Weloyo/{raw}?foo=1") == raw
     assert providers._gist_id(f"  {raw}#file  ") == raw
     assert providers._gist_id("") == ""
+
+
+def test_kaggle_configured_by_either_scheme():
+    view = {"has_kaggle_json": False, "has_kaggle_token": True}
+    assert providers.configured("kaggle", {}, view) is True
+    view = {"has_kaggle_json": True, "has_kaggle_token": False}
+    assert providers.configured("kaggle", {}, view) is True
+    assert providers.configured("kaggle", {}, {}) is False
 
 
 def test_configured_flags():

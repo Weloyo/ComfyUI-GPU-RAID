@@ -139,6 +139,10 @@ DEFAULT_SETTINGS = {
         "model": "",
         "temperature": 0.7,
     },
+    # Kaggle: имя аккаунта (нужно для слага кернела; в новой схеме токена его нет)
+    "kaggle": {
+        "username": "",
+    },
     # авторегистрация воркеров через приватный GitHub Gist
     "rendezvous": {
         "gist_id": "",

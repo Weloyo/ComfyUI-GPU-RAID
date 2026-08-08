@@ -29,23 +29,43 @@ KERNEL_TITLE = "gpu-raid-worker"
 
 
 def _cli():
-    exe = shutil.which("kaggle")
+    from . import providers
+
+    exe = providers.kaggle_cli_path()
     if not exe:
-        raise RuntimeError("kaggle CLI не найден: pip install kaggle (в python мастера)")
+        raise RuntimeError(
+            "kaggle CLI не найден: панель → «Подключения и ключи» → Kaggle → "
+            "«Установить kaggle CLI»")
     return exe
 
 
 def _env():
     env = dict(os.environ)
-    env["KAGGLE_CONFIG_DIR"] = config.state_dir()  # там лежит kaggle.json
+    env["KAGGLE_CONFIG_DIR"] = config.state_dir()   # старая схема: kaggle.json
+    token = secret_store.get("kaggle_token")
+    if token:
+        env["KAGGLE_API_TOKEN"] = token             # новая схема: строка KGAT_…
     return env
 
 
 def username():
-    data = config.load_json(secret_store.kaggle_json_path(), None)
-    if not data or not data.get("username"):
-        raise RuntimeError("kaggle.json не сохранён (панель → Режимы → секреты)")
-    return data["username"]
+    from . import providers
+
+    user = providers.kaggle_username()
+    if not user:
+        raise RuntimeError(
+            "не указан аккаунт Kaggle (панель → «Подключения и ключи» → Kaggle)")
+    return user
+
+
+async def check_cli():
+    """Дёргает CLI под сохранёнными кредами: (ok, вывод). Для проверки токена."""
+    try:
+        code, text = await _run("kernels", "list", "--mine", "--page-size", "1",
+                                timeout=90)
+    except Exception as e:
+        return False, f"{type(e).__name__}: {e}"
+    return code == 0, text
 
 
 def kernel_slug():

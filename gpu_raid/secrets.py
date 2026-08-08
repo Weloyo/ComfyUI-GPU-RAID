@@ -13,7 +13,7 @@ import os
 
 from . import config
 
-KEYS = ("llm_api_key", "gh_token", "hf_token", "civitai_token")
+KEYS = ("llm_api_key", "gh_token", "hf_token", "civitai_token", "kaggle_token")
 
 
 def secrets_path():
@@ -75,5 +75,7 @@ def public_view():
         "has_gh_token": bool(data.get("gh_token")),
         "has_hf_token": bool(data.get("hf_token")),
         "has_civitai_token": bool(data.get("civitai_token")),
+        # старая схема — файл kaggle.json, новая — токен KGAT_… в secrets.json
         "has_kaggle_json": os.path.isfile(kaggle_json_path()),
+        "has_kaggle_token": bool(data.get("kaggle_token")),
     }
