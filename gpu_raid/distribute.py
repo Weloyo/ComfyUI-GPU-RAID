@@ -104,6 +104,18 @@ async def plan(graph):
     }
 
 
+def is_downloading(worker_id):
+    """Тянет ли воркер сейчас модель.
+
+    Для lifecycle это тоже работа: качающий 40 ГБ воркер не выполняет заданий
+    и без этой проверки выглядит простаивающим — политики eco/instant погасили
+    бы его посреди закачки, и всё пришлось бы начинать заново.
+    """
+    return any(t.get("worker_id") == worker_id
+               and t.get("state") in ("starting", "downloading")
+               for t in TASKS.values())
+
+
 def _task_key(wid, folder, filename):
     return f"{wid}|{modelsrc.key(folder, filename)}"
 

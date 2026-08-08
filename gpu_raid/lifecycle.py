@@ -43,7 +43,12 @@ class Lifecycle:
                 log.exception("lifecycle tick failed")
 
     def _view(self, record, now, busy):
+        from . import distribute
+
         wid = record["id"]
+        # закачка модели — тоже занятость этого воркера, иначе eco/instant
+        # погасят его посреди 40 ГБ
+        busy = busy or distribute.is_downloading(wid)
         st = REGISTRY.status.get(wid, {})
         last = MANAGER.worker_last_active.get(wid)
         online_since = st.get("online_since")
