@@ -26,6 +26,8 @@ TEMPLATE_PATH = os.path.join(
 )
 
 KERNEL_TITLE = "gpu-raid-worker"
+SECRET_DATASET_TITLE = "gpu-raid-secrets"
+SECRET_FILE = "gpuraid_secrets.json"
 
 
 def _cli():
@@ -72,8 +74,60 @@ def kernel_slug():
     return f"{username()}/{KERNEL_TITLE}"
 
 
+def secret_dataset_slug():
+    return f"{username()}/{SECRET_DATASET_TITLE}"
+
+
+async def ensure_secret_dataset():
+    """Приватный датасет с токенами для кернела — создаёт или обновляет версию.
+
+    Зачем: Kaggle Secrets привязываются к ноутбуку ТОЛЬКО через веб-интерфейс,
+    в kernel-metadata.json такого поля нет. Значит запуск «одной кнопкой» через
+    них невозможен. Датасет же и создаётся, и подключается к кернелу по API —
+    поэтому секреты едут им. Датасет приватный; токены в исходник кернела при
+    этом не попадают (их не будет в истории версий кода).
+
+    Возвращает slug или "" — если секретов нет, датасет не нужен.
+    """
+    from . import secrets as secret_store
+
+    payload = {}
+    for name, key in (("GH_TOKEN", "gh_token"), ("HF_TOKEN", "hf_token"),
+                      ("CIVITAI_TOKEN", "civitai_token")):
+        value = secret_store.get(key)
+        if value:
+            payload[name] = value
+    if not payload:
+        return ""
+
+    slug = secret_dataset_slug()
+    d = tempfile.mkdtemp(prefix="gpuraid_ds_")
+    try:
+        with open(os.path.join(d, SECRET_FILE), "w", encoding="utf-8") as f:
+            json.dump(payload, f)
+        with open(os.path.join(d, "dataset-metadata.json"), "w", encoding="utf-8") as f:
+            json.dump({"id": slug, "title": SECRET_DATASET_TITLE,
+                       "licenses": [{"name": "CC0-1.0"}]}, f, indent=2)
+        # приватность по умолчанию: у `datasets create` флаг -u/--public делает
+        # датасет публичным — здесь его быть не должно ни при каких условиях
+        code, text = await _run("datasets", "create", "-p", d, "-r", "skip",
+                                timeout=180)
+        if code != 0:
+            if "already exists" not in text.lower() and "409" not in text:
+                raise RuntimeError(f"kaggle datasets create: {text[:400]}")
+            code, text = await _run("datasets", "version", "-p", d, "-m",
+                                    "gpu raid secrets update", "-r", "skip",
+                                    timeout=180)
+            if code != 0:
+                raise RuntimeError(f"kaggle datasets version: {text[:400]}")
+    finally:
+        shutil.rmtree(d, ignore_errors=True)
+    return slug
+
+
 def build_kernel_dir(params):
-    """params: repo_url, gist_id, model_preset, max_session_min, name_prefix."""
+    """params: repo_url, gist_id, model_preset, max_session_min, name_prefix,
+    secret_dataset (slug приватного датасета с токенами или "")."""
     with open(TEMPLATE_PATH, encoding="utf-8") as f:
         src = f.read()
     for key, value in params.items():
@@ -81,6 +135,7 @@ def build_kernel_dir(params):
     d = tempfile.mkdtemp(prefix="gpuraid_kaggle_")
     with open(os.path.join(d, "worker.py"), "w", encoding="utf-8") as f:
         f.write(src)
+    secret_ds = str(params.get("secret_dataset") or "").strip()
     meta = {
         "id": kernel_slug(),
         "title": KERNEL_TITLE,
@@ -90,7 +145,7 @@ def build_kernel_dir(params):
         "is_private": True,
         "enable_gpu": True,
         "enable_internet": True,
-        "dataset_sources": [],
+        "dataset_sources": [secret_ds] if secret_ds else [],
         "competition_sources": [],
         "kernel_sources": [],
         "model_sources": [],
@@ -115,7 +170,14 @@ async def _run(*args, timeout=120):
 
 
 async def push(params):
-    """Пушит и запускает batch-кернел. Возвращает {kernel, log}."""
+    """Пушит и запускает batch-кернел. Возвращает {kernel, log, secret_dataset}.
+
+    Перед пушем поднимает приватный датасет с токенами и подключает его к
+    кернелу — иначе воркер не сможет опубликовать свой адрес в гисте, а мы
+    вернулись бы к ручному заходу в веб-интерфейс Kaggle за Secrets.
+    """
+    params = dict(params)
+    params["secret_dataset"] = await ensure_secret_dataset()
     kdir = build_kernel_dir(params)
     try:
         code, text = await _run("kernels", "push", "-p", kdir, timeout=180)
@@ -123,7 +185,8 @@ async def push(params):
         shutil.rmtree(kdir, ignore_errors=True)
     if code != 0:
         raise RuntimeError(f"kaggle push: {text[:500]}")
-    return {"kernel": kernel_slug(), "log": text[:500]}
+    return {"kernel": kernel_slug(), "log": text[:500],
+            "secret_dataset": params.get("secret_dataset", "")}
 
 
 async def status():

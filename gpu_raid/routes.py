@@ -389,10 +389,15 @@ async def kaggle_start(request):
     gist_id = (settings.get("rendezvous") or {}).get("gist_id", "")
     secrets_view = secret_store.public_view()
     if not gist_id or not secrets_view["has_gh_token"]:
-        return _err(409, "автозапуску Kaggle нужен gist-rendezvous: задайте gist_id "
-                         "и GitHub-токен в панели (Режимы)")
-    if not secrets_view["has_kaggle_json"]:
-        return _err(409, "kaggle.json не сохранён (панель → Режимы → секреты)")
+        return _err(409, "автозапуску Kaggle нужен gist-rendezvous: панель → "
+                         "«Подключения и ключи» → GitHub (токен + кнопка «Создать "
+                         "приватный gist»)")
+    if not providers.configured("kaggle", settings, secrets_view):
+        return _err(409, "токен Kaggle не сохранён: панель → «Подключения и ключи» "
+                         "→ Kaggle")
+    if not providers.kaggle_cli_present():
+        return _err(409, "kaggle CLI не установлен: панель → «Подключения и ключи» "
+                         "→ Kaggle → «Установить kaggle CLI»")
     params = {
         "repo_url": data.get("repo_url") or REPO_URL,
         "gist_id": gist_id,
