@@ -10,6 +10,7 @@ Offload, Pipeline) — пульты управления мастером пря
 import logging
 import os
 import queue as thread_queue
+import shutil
 import time
 import uuid
 
@@ -262,37 +263,43 @@ class GPURaidTiledUpscale:
                     except Exception as e:
                         log.warning("tile %s: не удалось прочитать результат (%s)", idx, e)
 
-        while len(computed) < n:
-            mm.throw_exception_if_processing_interrupted()
-            drain_remote()
-            pick = None
-            inflight = dict(job_obj.inflight) if job_obj else {}
-            for idx in my_order:
-                if idx not in computed and idx not in inflight and idx not in stolen:
-                    pick = idx
-                    break
-            if pick is None:
-                # остались только тайлы в полёте у облака: воруем самый старый
-                pending = [i for i in range(n) if i not in computed]
-                if not pending:
-                    break
-                if remote_done:
-                    pick = pending[0]  # облако закончилось, добираем сами
-                else:
-                    steal = next((i for i in pending if i not in stolen), None)
-                    if steal is None:
-                        drain_remote(block_s=0.5)
-                        continue
-                    stolen.add(steal)
-                    pick = steal
-            result = local_compute(pick)
-            if pick not in computed:
-                computed[pick] = result
-                if pick in stolen and job_id_remote:
-                    MANAGER.cancel_unit_blocking(job_id_remote, pick)
-
-        if job_id_remote:
-            MANAGER.cancel_job_blocking(job_id_remote)
+        try:
+            while len(computed) < n:
+                mm.throw_exception_if_processing_interrupted()
+                drain_remote()
+                pick = None
+                inflight = dict(job_obj.inflight) if job_obj else {}
+                for idx in my_order:
+                    if idx not in computed and idx not in inflight and idx not in stolen:
+                        pick = idx
+                        break
+                if pick is None:
+                    # остались только тайлы в полёте у облака: воруем самый старый
+                    pending = [i for i in range(n) if i not in computed]
+                    if not pending:
+                        break
+                    if remote_done:
+                        pick = pending[0]  # облако закончилось, добираем сами
+                    else:
+                        steal = next((i for i in pending if i not in stolen), None)
+                        if steal is None:
+                            drain_remote(block_s=0.5)
+                            continue
+                        stolen.add(steal)
+                        pick = steal
+                result = local_compute(pick)
+                if pick not in computed:
+                    computed[pick] = result
+                    if pick in stolen and job_id_remote:
+                        MANAGER.cancel_unit_blocking(job_id_remote, pick)
+        finally:
+            # Interrupt/OOM в local_compute не должны оставлять облако молотить
+            # оставшиеся тайлы вхолостую: без отмены job штатно доберёт всю
+            # очередь (upload+рендер+download на каждый), хотя читать результат
+            # уже некому — тратится чужая GPU-квота и трафик туннеля впустую
+            if job_id_remote:
+                MANAGER.cancel_job_blocking(job_id_remote)
+            shutil.rmtree(tiles_abs_dir, ignore_errors=True)
 
         # --- определяем масштаб и склеиваем с фезером ---
         first = computed[0]
@@ -334,13 +341,8 @@ class GPURaidTiledUpscale:
         weight = torch.clamp(weight, min=1e-6)
         out = (canvas / weight).unsqueeze(0)
 
-        # уборка временных тайлов
-        try:
-            import shutil
-
-            shutil.rmtree(tiles_abs_dir, ignore_errors=True)
-        except Exception:
-            pass
+        # тайлы уже убраны в finally выше (тем же rmtree, ignore_errors=True —
+        # безусловно, независимо от исхода цикла)
         return (out,)
 
 

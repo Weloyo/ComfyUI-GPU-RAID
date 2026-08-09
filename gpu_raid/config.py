@@ -73,3 +73,18 @@ def merged_settings(stored):
 def sanitize_name(name, fallback="job"):
     keep = "".join(c if c.isalnum() or c in "-_." else "_" for c in str(name).strip())
     return keep[:60] or fallback
+
+
+def safe_filename(name):
+    """Одно имя файла без разделителей пути — защита от path traversal.
+
+    Имя приходит из недоверенного источника (тело запроса к мастеру, поле
+    filename из /history воркера): срезаем каталоги и оставляем базовое имя,
+    отклоняя пустое/'.'/'..'. Разделители обеих ОС режем всегда — имена
+    моделей и результатов их не содержат, а мастер и воркеры бывают на разных
+    платформах, так что basename одной ОС не спасает от разделителя другой.
+    """
+    base = str(name).replace("\\", "/").rsplit("/", 1)[-1].strip()
+    if base in ("", ".", ".."):
+        raise ValueError(f"недопустимое имя файла: {name!r}")
+    return base

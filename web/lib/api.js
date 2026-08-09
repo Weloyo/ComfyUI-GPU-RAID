@@ -9,7 +9,11 @@ async function request(method, path, body) {
     let data = {};
     try { data = await r.json(); } catch (e) { /* пустой ответ */ }
     if (!r.ok) {
-        const msg = data.reason || data.error || `HTTP ${r.status}`;
+        // некоторые роуты (например, добавление воркеров) кладут причины по
+        // каждой невалидной строке в errors — без этого падения все строки
+        // разом давали бесполезный тост «HTTP 400» вместо конкретной причины
+        const fromList = Array.isArray(data.errors) && data.errors.length ? data.errors.join("; ") : null;
+        const msg = data.reason || data.error || fromList || `HTTP ${r.status}`;
         const err = new Error(msg);
         err.status = r.status;
         throw err;

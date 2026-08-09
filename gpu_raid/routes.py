@@ -9,6 +9,7 @@ import logging
 import os
 import platform
 import time
+from urllib.parse import urlsplit
 
 from aiohttp import web
 
@@ -35,9 +36,31 @@ _STARTED = time.time()
 
 
 def _guard_master(request):
-    if auth.is_local_request(request) or auth.configured_token():
+    if not (auth.is_local_request(request) or auth.configured_token()):
+        raise web.HTTPForbidden(reason="master endpoints: loopback only")
+    _guard_csrf(request)
+
+
+def _guard_csrf(request):
+    """CSRF: мутирующий master-роут не исполняем по межсайтовому запросу.
+
+    Loopback-guard сам по себе от CSRF не защищает — вредоносная страница из
+    браузера пользователя шлёт «простой» POST (text/plain, без preflight) на
+    127.0.0.1 и проходит как локальный. Но браузер не даёт странице подделать
+    Sec-Fetch-* и Origin, поэтому их и проверяем. Не-браузерные клиенты
+    (скрипты, тесты, внутренние вызовы) этих заголовков не шлют — их пропускаем,
+    CSRF там неприменим.
+    """
+    if request.method in ("GET", "HEAD", "OPTIONS"):
         return
-    raise web.HTTPForbidden(reason="master endpoints: loopback only")
+    site = request.headers.get("Sec-Fetch-Site")
+    if site is not None:
+        if site not in ("same-origin", "none"):
+            raise web.HTTPForbidden(reason="cross-site request blocked")
+        return
+    origin = request.headers.get("Origin")
+    if origin and urlsplit(origin).netloc != request.headers.get("Host", ""):
+        raise web.HTTPForbidden(reason="cross-origin request blocked")
 
 
 async def _json(request):
@@ -326,9 +349,12 @@ async def workers_download(request):
         return _err(404, "worker not found")
     payload = await _json(request)
     if wid == LOCAL_ID:
-        task_id = downloads.start(asyncio.get_running_loop(), payload.get("folder"),
-                                  payload.get("url"), payload.get("filename"),
-                                  payload.get("hf_token"), payload.get("civitai_token"))
+        try:
+            task_id = downloads.start(asyncio.get_running_loop(), payload.get("folder"),
+                                      payload.get("url"), payload.get("filename"),
+                                      payload.get("hf_token"), payload.get("civitai_token"))
+        except ValueError as e:
+            return _err(400, str(e))
         return web.json_response({"task_id": task_id})
     try:
         body = await REGISTRY.client(record).download_model(payload)

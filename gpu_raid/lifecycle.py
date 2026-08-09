@@ -65,11 +65,34 @@ class Lifecycle:
             "keep_alive_until": self.keep_alive_until.get(wid, 0),
         }
 
+    def _global_busy(self):
+        # busy правила трактуют глобально: пока есть хоть один НЕзавершённый
+        # job, не гасим никого. Пересчитываем на каждом шаге — см. tick().
+        return any(not j.done_event.is_set() for j in MANAGER.jobs.values())
+
+    def _managed_records(self):
+        # только включённые облачные/LAN: выключенный воркер выведен из пула,
+        # heartbeat его не пробит (телеметрия заморожена), и гасить его незачем —
+        # иначе тик за тиком мастер долбится в мёртвый туннель и спамит тостами
+        return [r for r in REGISTRY.records(include_local=False) if r.get("enabled")]
+
     async def tick(self):
         cfg = REGISTRY.settings().get("lifecycle") or {}
-        now = time.time()
-        busy = any(not j.done_event.is_set() for j in MANAGER.jobs.values())
-        for record in REGISTRY.records(include_local=False):
+        # сами опрашиваем прогресс закачек моделей: иначе статус двигает только
+        # открытая вкладка панели, и брошенная вкладкой закачка держит воркера
+        # busy вечно — а busy в правилах глушит и eco/instant, и предохранитель
+        # budget_min (квота выгорает до платформенного лимита сессии)
+        try:
+            from . import distribute
+            await distribute.progress()
+        except Exception:
+            log.exception("lifecycle: опрос закачек не удался")
+        for record in self._managed_records():
+            # now и busy пересчитываем на КАЖДОГО воркера: остановки идут через
+            # await (POST в туннель до 15с), и за это время мог прийти новый job —
+            # со старым снимком busy мы бы погасили воркера, взявшего юнит
+            now = time.time()
+            busy = self._global_busy()
             view = self._view(record, now, busy)
             decision, reason = rules.decide(cfg, view, now)
             if decision == rules.STOP:
@@ -79,9 +102,9 @@ class Lifecycle:
         """Для GET /gpuraid/lifecycle: что тикер думает о каждом воркере."""
         cfg = REGISTRY.settings().get("lifecycle") or {}
         now = time.time()
-        busy = any(not j.done_event.is_set() for j in MANAGER.jobs.values())
+        busy = self._global_busy()
         out = []
-        for record in REGISTRY.records(include_local=False):
+        for record in self._managed_records():
             view = self._view(record, now, busy)
             decision, reason = rules.decide(cfg, view, now)
             out.append({

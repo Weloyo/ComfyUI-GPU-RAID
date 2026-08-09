@@ -105,6 +105,11 @@ function hookQueue() {
                     return original(number, data, ...rest);
                 }
                 toast("error", "GPU RAID", e.message);
+                // помечаем: это намеренный проброс (FallbackLocal выключен) —
+                // внешний catch ниже иначе решит, что это сбой ХУКА, и всё
+                // равно запустит граф локально original(...), сведя настройку
+                // на нет
+                e.__gpuraid_rethrow = true;
                 throw e;
             }
         } catch (e) {

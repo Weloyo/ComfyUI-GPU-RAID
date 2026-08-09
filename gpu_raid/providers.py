@@ -369,12 +369,18 @@ async def save(pid, payload):
             settings_patch["kaggle"] = {"username": str(payload["username"]).strip()}
         if given("kaggle_json") and str(payload["kaggle_json"]).strip():
             creds = parse_kaggle_credentials(payload["kaggle_json"])
+            # новая (KGAT-токен) и старая (kaggle.json) схемы взаимоисключающи:
+            # сохраняя одну, стираем артефакт другой. Иначе отозванный старый
+            # kaggle.json затеняет только что вставленный валидный токен —
+            # _check_kaggle проверяет legacy_key первым и возвращает «401».
             if creds["kind"] == "json":
                 _secrets().save_kaggle_json(json.dumps(
                     {"username": creds["username"], "key": creds["key"]}))
                 settings_patch.setdefault("kaggle", {})["username"] = creds["username"]
+                sec["kaggle_token"] = ""             # пустое значение — save() удалит ключ
             else:
                 sec["kaggle_token"] = creds["token"]
+                _secrets().save_kaggle_json("")      # пустой текст — удаляет файл kaggle.json
     elif pid == "huggingface":
         if given("hf_token") and str(payload["hf_token"]).strip():
             sec["hf_token"] = str(payload["hf_token"]).strip()

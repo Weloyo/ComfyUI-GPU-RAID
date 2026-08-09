@@ -14,7 +14,7 @@ import uuid
 
 import folder_paths
 
-from . import events, results
+from . import config, events, results
 from .consts import SAVE_NODE_ID
 from .graph_rewrite import (
     RewriteError,
@@ -103,6 +103,7 @@ class WsHub:
         self.task = None
         self.connected = False
         self.last_used = time.monotonic()
+        self._url = None   # url клиента, с которым запущена текущая ws-задача
 
     def track(self, prompt_id):
         tp = TrackedPrompt()
@@ -118,7 +119,18 @@ class WsHub:
         return bool(self.tracked) or (time.monotonic() - self.last_used) < 120
 
     def ensure(self, loop, wc):
+        if self.task is not None and not self.task.done() and self._url != wc.url:
+            # rendezvous переписал url (туннель переродился) — старая задача
+            # крутит reconnect на МЁРТВОМ адресе; пока по воркеру идут юниты,
+            # _should_run держит её вечно, и она сама не переключится. Без
+            # пересоздания hub.connected остаётся False, а стал-детект в
+            # _monitor от него зависит — зависший юнит не отстрелится по
+            # stall-таймауту, провисит до hard_cap (часы)
+            self.task.cancel()
+            self.task = None
+            self.connected = False
         if self.task is None or self.task.done():
+            self._url = wc.url
             self.task = loop.create_task(wc.ws_loop(self.client_id, self.on_event, self._should_run))
 
     def on_event(self, event):
@@ -187,6 +199,7 @@ class Job:
         self.tail_prompt_id = None
         self.done_event = asyncio.Event()
         self.thread_results = None        # queue.Queue для upscale-нод
+        self.stolen = set()               # unit.index, украденные steal-back'ом (upscale)
         self.build_graph = None           # callable(unit) -> graph (без спец-обработки воркера)
         self.timeouts = {}
         self.outdir = None
@@ -369,6 +382,12 @@ class JobManager:
         record = REGISTRY.get(worker_id)
         if record is None or not record.get("enabled"):
             raise RewriteError("Воркер не найден или выключен")
+        if worker_id in self.reserved:
+            # reserved — set, а не счётчик по job'ам: без этой проверки второй
+            # offload на того же воркера дискардит резерв первым же finally,
+            # пока первый ещё исполняется, и stripe-юниты сядут в очередь
+            # позади незавершённого тяжёлого графа и словят startup-таймаут
+            raise RewriteError("Воркер уже занят offload-задачей")
         spliced, warnings = splice_gpuraid(graph)
         job = Job("offload", client_id=client_id, label=label or f"offload-{worker_id}")
         job.warnings = warnings
@@ -447,6 +466,11 @@ class JobManager:
             job = self.jobs.get(job_id)
             if not job:
                 return
+            # steal-back (единственный вызывающий): тайл уже посчитан локально —
+            # без этой метки _consumer увидит retriable UnitFailure('прервано на
+            # воркере') и переисполнит тот же индекс с нуля (upload+рендер+
+            # download), пока drain_remote молча выбросит результат
+            job.stolen.add(index)
             entry = job.inflight.get(index)
             if entry:
                 wid, pid = entry
@@ -493,8 +517,18 @@ class JobManager:
         self.history.insert(0, summary)
         del self.history[20:]
         events.send("job_done", summary)
+        # снапшот уже в history — держать job (с полными графами/шаблонами
+        # story/longvideo — сотни КБ на КАЖДЫЙ сегмент) в self.jobs дальше
+        # некому: /gpuraid/jobs фильтрует по done_event, а /jobs/{id} и cancel
+        # уже штатно отвечают "not found"/no-op для отсутствующего job'а.
+        # Мастер живёт сутками — без очистки это неограниченный рост памяти.
+        self.jobs.pop(job.job_id, None)
+        events.clear_prefix(f"u:{job.job_id}:")
         if job.kind == "stripe":
-            results.gc_jobs(REGISTRY.settings().get("keep_last_jobs", 5))
+            # rmtree на event loop'е (сотни PNG под антивирусом — сотни мс)
+            # подвешивает весь веб-UI и мониторинг юнитов на это время
+            self.loop.create_task(asyncio.to_thread(
+                results.gc_jobs, REGISTRY.settings().get("keep_last_jobs", 5)))
         if REGISTRY.settings().get("free_after_job"):
             # гигиена VRAM: выгрузить модели на удалённых воркерах после job'а
             for wid in job.stats.get("per_worker", {}):
@@ -548,6 +582,14 @@ class JobManager:
                 job.queue.put_nowait((0, index))
                 break
             except UnitFailure as e:
+                if index in job.stolen:
+                    # steal-back: локалка уже досчитала этот тайл — переисполнение
+                    # бессмысленно, drain_remote его результат всё равно выбросит
+                    unit.state = DEAD
+                    unit.error = "перехвачено локальной GPU (steal-back)"
+                    unit.t_done = time.monotonic()
+                    self._emit_unit(job, unit)
+                    continue
                 unit.error = str(e)
                 if e.worker_fault:
                     job.strikes[wid] = job.strikes.get(wid, 0) + 1
@@ -809,7 +851,10 @@ class JobManager:
                         continue
                     if ref.get("type") not in (None, "output"):
                         continue
-                    name = ref["filename"]
+                    # filename из /history воркера недоверенный: '../custom_nodes/x.py'
+                    # писал бы на диск мастера (RCE). safe_filename бросит ValueError,
+                    # которую обёртка _fetch превратит в UnitFailure.
+                    name = config.safe_filename(ref["filename"])
                     if name in seen:
                         name = f"{node_id}_{name}"
                     seen.add(name)
@@ -876,7 +921,7 @@ class JobManager:
                         continue
                     if ref.get("type") not in (None, "output"):
                         continue
-                    dest = os.path.join(job.outdir, ref["filename"])
+                    dest = os.path.join(job.outdir, config.safe_filename(ref["filename"]))
                     await wc.download_view(ref, dest)
                     unit.files.append(dest)
 

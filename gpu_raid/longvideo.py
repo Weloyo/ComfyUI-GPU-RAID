@@ -15,6 +15,7 @@ GPURAID:START_IMAGE / GPURAID:END_IMAGE / GPURAID:PROMPT / GPURAID:VIDEO_OUT.
 перезапуска). Экспорт: concat без перекодирования или монтаж с тримами/кроссфейдом.
 """
 
+import asyncio
 import logging
 import os
 import shutil
@@ -232,7 +233,6 @@ async def _run_chain(job, spec, manifest, count, prompts, base_seed, policy, sta
     try:
         for i in range(count):
             if job.cancelled:
-                manifest["state"] = "cancelled"
                 break
             prompt = None
             if prompts:
@@ -244,14 +244,25 @@ async def _run_chain(job, spec, manifest, count, prompts, base_seed, policy, sta
             job.unit_graphs = getattr(job, "unit_graphs", {})
             job.unit_graphs[i] = ugraph
             job.build_graph = lambda u: job.unit_graphs[u.index]
+
+            # свежая копия перед каждой записью: PATCH /segments и /edit пишут
+            # прямо в файл, пока рендерится очередной сегмент (минуты) — запись
+            # одного и того же in-memory manifest всю цепочку стирала бы эти
+            # правки на каждом шаге
+            manifest = load_manifest(job.label) or manifest
             manifest["segments"].append(_manifest_segment(unit))
             save_manifest(manifest)
 
             ok = await _execute_on_any(job, unit)
-            manifest["segments"][i] = _manifest_segment(unit)
+            manifest = load_manifest(job.label) or manifest
+            segs = manifest.get("segments", [])
+            pos = next((k for k, s in enumerate(segs) if s["index"] == i), None)
+            if pos is None:
+                segs.append(_manifest_segment(unit))
+            else:
+                segs[pos] = _manifest_segment(unit)
             save_manifest(manifest)
             if not ok:
-                manifest["state"] = "failed"
                 events.toast("error",
                              f"Long Video «{job.label}»: сегмент {i} не выполнен — цепочка остановлена "
                              f"({unit.error})")
@@ -263,11 +274,11 @@ async def _run_chain(job, spec, manifest, count, prompts, base_seed, policy, sta
             current_start = f"{frames_rel_dir}/f{i + 1:03d}.png"
         else:
             job.finished = "COMPLETE"
-            manifest["state"] = "done"
         await _finalize(job, manifest)
     except Exception as e:
         log.exception("chain failed")
         job.finished = "FAILED"
+        manifest = load_manifest(job.label) or manifest
         manifest["state"] = "failed"
         job.errors.append(str(e))
         save_manifest(manifest)
@@ -311,28 +322,45 @@ async def _execute_on_any(job, unit, fetch="longvideo"):
 
 
 async def _finalize(job, manifest):
-    done = [u for u in job.units if u.state == DONE]
-    manifest["segments"] = [_manifest_segment(u) for u in job.units]
+    """Мерж статусов юнитов по index в СВЕЖИЙ манифест с диска — не полная
+    перезапись снапшотом из замыкания при старте job'а (образец: одноимённая
+    story._finalize_segments), иначе PATCH /segments и /edit, сделанные за
+    время рендера, молча затираются."""
+    current = load_manifest(job.label) or manifest
+    seg_by_index = {s["index"]: s for s in current.get("segments", [])}
+    for unit in job.units:
+        seg = seg_by_index.get(unit.index)
+        if seg is None:
+            continue
+        if unit.state == DONE:
+            seg["status"] = "done"
+            seg["worker"] = unit.worker_id
+            seg["error"] = ""
+        else:
+            seg["status"] = "failed"
+            seg["error"] = unit.error or ""
+
+    done = sum(1 for u in job.units if u.state == DONE)
     if job.cancelled:
-        manifest["state"] = "cancelled"
+        current["state"] = "cancelled"
     elif not done:
-        manifest["state"] = "failed"
+        current["state"] = "failed"
         job.finished = "FAILED"
-    elif len(done) < len(job.units):
-        manifest["state"] = "partial"
+    elif done < len(job.units):
+        current["state"] = "partial"
         job.finished = "PARTIAL"
-        events.toast("warn", f"Long Video «{job.label}»: готово {len(done)}/{len(job.units)} сегментов")
+        events.toast("warn", f"Long Video «{job.label}»: готово {done}/{len(job.units)} сегментов")
     else:
-        manifest["state"] = manifest.get("state") if manifest.get("state") == "done" else "done"
+        current["state"] = current.get("state") if current.get("state") == "done" else "done"
         job.finished = job.finished or "COMPLETE"
 
     # автосклейка без перекодирования, если все сегменты готовы и кроссфейд не задан
-    if manifest["state"] == "done" and not manifest.get("crossfade_s"):
+    if current["state"] == "done" and not current.get("crossfade_s"):
         try:
-            files = [os.path.join(job.outdir, s["file"]) for s in manifest["segments"]]
-            final = os.path.join(job.outdir, f"{manifest['label']}_full.mp4")
+            files = [os.path.join(job.outdir, s["file"]) for s in current.get("segments", [])]
+            final = os.path.join(job.outdir, f"{current['label']}_full.mp4")
             await video.concat_copy(files, final)
-            manifest["final"] = os.path.basename(final)
+            current["final"] = os.path.basename(final)
             events.toast("success",
                          f"Long Video «{job.label}»: {len(files)} сегментов склеены → {final}")
         except Exception as e:
@@ -340,7 +368,7 @@ async def _finalize(job, manifest):
             events.toast("warn",
                          f"Long Video «{job.label}»: сегменты готовы, авто-склейка не удалась ({e}) — "
                          "нажмите «Экспорт» в ноде проекта")
-    save_manifest(manifest)
+    save_manifest(current)
 
 
 # ---------------------------------------------------------------------------
@@ -381,20 +409,32 @@ async def rerender_segment(label, index, seed=None, prompt=None):
     MANAGER._register(job)
 
     async def _run():
-        ok = await _execute_on_any(job, unit)
-        current = load_manifest(label) or manifest
-        cseg = next((s for s in current.get("segments", []) if s["index"] == index), None)
-        if cseg is not None:
-            updated = _manifest_segment(unit)
-            updated["file"] = cseg["file"]  # имя файла в проекте неизменно
-            current["segments"][current["segments"].index(cseg)] = updated
-            save_manifest(current)
-        job.finished = "COMPLETE" if ok else "FAILED"
-        job.state = job.finished
-        job.done_event.set()
-        MANAGER._archive(job)
-        if ok:
-            events.toast("success", f"Long Video «{label}»: сегмент {index} перегенерирован (seed {new_seed})")
+        try:
+            ok = await _execute_on_any(job, unit)
+            current = load_manifest(label) or manifest
+            cseg = next((s for s in current.get("segments", []) if s["index"] == index), None)
+            if cseg is not None:
+                updated = _manifest_segment(unit)
+                updated["file"] = cseg["file"]  # имя файла в проекте неизменно
+                current["segments"][current["segments"].index(cseg)] = updated
+                save_manifest(current)
+            job.finished = "COMPLETE" if ok else "FAILED"
+            if ok:
+                events.toast("success",
+                             f"Long Video «{label}»: сегмент {index} перегенерирован (seed {new_seed})")
+        except Exception as e:
+            # без finally любой сбой (PermissionError из os.replace манифеста на
+            # Windows, ошибка записи) оставил бы done_event невыставленным — а
+            # глобальный busy тогда навсегда отключает весь автостоп воркеров
+            log.exception("rerender segment failed")
+            job.finished = "FAILED"
+            job.errors.append(str(e))
+            events.toast("error",
+                         f"Long Video «{label}»: перегенерация сегмента {index} не удалась ({e})")
+        finally:
+            job.state = job.finished or "FAILED"
+            job.done_event.set()
+            MANAGER._archive(job)
 
     MANAGER.loop.create_task(_run())
     return job
@@ -428,15 +468,19 @@ async def delete_project(label):
     if not manifest:
         raise RewriteError(f"Проект {label} не найден")
     input_base = os.path.abspath(config.input_dir())
+    targets = []
     for rel in (manifest.get("frames_dir"),
                 f"gpuraid_story/{config.sanitize_name(label)}"):
         if not rel:
             continue
         path = os.path.abspath(os.path.join(input_base, rel))
         if path.startswith(input_base):
-            shutil.rmtree(path, ignore_errors=True)
-    shutil.rmtree(os.path.join(config.deliver_base(), config.sanitize_name(label)),
-                  ignore_errors=True)
+            targets.append(path)
+    targets.append(os.path.join(config.deliver_base(), config.sanitize_name(label)))
+    # rmtree синхронно на event loop'е подвесил бы веб-UI и мониторинг юнитов
+    # на время удаления — проект может содержать десятки сегментов/кадров
+    for path in targets:
+        await asyncio.to_thread(shutil.rmtree, path, ignore_errors=True)
     events.send("longvideo", {"label": label, "deleted": True})
     return True
 

@@ -273,6 +273,20 @@ def _link(src, comfy_dir, folder, name):
         return 0
 
 
+def _atomic_copy(src, dst):
+    """Копия через временный файл в том же каталоге + os.replace.
+
+    Обрыв копии (прерванная ячейка Colab посреди 20-гиговой копии в MyDrive)
+    не должен оставить обрезок под финальным именем: size>0 его не отличит, и
+    следующая сессия примет обрезок за готовую модель — рендер упадёт на
+    заголовке safetensors, самоизлечения нет. С temp+rename обрезок либо
+    остаётся как .part, либо его нет вовсе.
+    """
+    tmp = dst + ".part"
+    shutil.copy(src, tmp)
+    os.replace(tmp, dst)
+
+
 def hf_download(preset_or_list, comfy_dir, hf_token=None, drive_cache_dir=None):
     """Скачивает модели пресета в comfy_dir/models/<folder>/.
 
@@ -308,7 +322,7 @@ def hf_download(preset_or_list, comfy_dir, hf_token=None, drive_cache_dir=None):
         drive_path = os.path.join(drive_cache_dir, folder, name) if drive_cache_dir else None
         if drive_path and os.path.exists(drive_path) and os.path.getsize(drive_path) > 0:
             print(f"[hf] копирую из Drive-кэша: {filename}")
-            shutil.copy(drive_path, dst)
+            _atomic_copy(drive_path, dst)
             continue
 
         print(f"[hf] скачиваю {repo_id}/{filename} -> {folder}")
@@ -316,12 +330,12 @@ def hf_download(preset_or_list, comfy_dir, hf_token=None, drive_cache_dir=None):
         try:
             os.symlink(path, dst)
         except OSError:
-            shutil.copy(path, dst)
+            _atomic_copy(path, dst)
 
         if drive_path:
             os.makedirs(os.path.dirname(drive_path), exist_ok=True)
             print(f"[hf] сохраняю в Drive-кэш: {filename}")
-            shutil.copy(os.path.realpath(dst), drive_path)
+            _atomic_copy(os.path.realpath(dst), drive_path)
 
 
 def model_inventory(comfy_dir):
@@ -470,12 +484,34 @@ def start_authproxy(gpuraid_src, listen_port, target_port, token):
 # туннели
 # ---------------------------------------------------------------------------
 
-def download_cloudflared(dest="/tmp/cloudflared"):
-    if not os.path.isfile(dest):
-        print("[tunnel] качаю cloudflared…")
-        urllib.request.urlretrieve(CLOUDFLARED_URL, dest)
-        os.chmod(dest, 0o755)
-    return dest
+def download_cloudflared(dest="/tmp/cloudflared", attempts=3):
+    # size>0: обрезок от прошлого обрыва не считаем готовым бинарником —
+    # с ним Popen падает PermissionError/ENOEXEC и туннель не поднимается
+    if os.path.isfile(dest) and os.path.getsize(dest) > 0:
+        return dest
+    tmp = dest + ".part"
+    last = None
+    for attempt in range(1, attempts + 1):
+        try:
+            print(f"[tunnel] качаю cloudflared… (попытка {attempt}/{attempts})")
+            # timeout обязателен: без него замерший CDN вешает bring_up навсегда
+            # (ComfyUI уже поднят, но туннеля нет — кернел молча жжёт квоту)
+            with urllib.request.urlopen(CLOUDFLARED_URL, timeout=60) as r, open(tmp, "wb") as f:
+                shutil.copyfileobj(r, f)
+            if os.path.getsize(tmp) == 0:
+                raise OSError("пустой ответ")
+            os.chmod(tmp, 0o755)
+            os.replace(tmp, dest)          # атомарно: обрезок не окажется под dest
+            return dest
+        except Exception as e:
+            last = e
+            try:
+                os.remove(tmp)
+            except OSError:
+                pass
+            print(f"[tunnel] cloudflared не скачался: {e}")
+            time.sleep(3 * attempt)
+    raise RuntimeError(f"cloudflared не скачался за {attempts} попыток: {last}")
 
 
 def start_cloudflared(port, attempts=3):
@@ -560,8 +596,12 @@ def bring_up(gpuraid_src, comfy_dir, token, gpus=(0,), base_port=8188,
     for i, gpu in enumerate(gpus):
         port = base_port + i
         session = f"{session_base}{i}" if len(gpus) > 1 else session_base
+        # sentinel НА ИНСТАНС, не на сессию: общий файл гасил бы весь Kaggle-
+        # кернел (оба GPU) при остановке из панели только одного простаивающего
+        # воркера из dual-T4 пары — job на втором инстансе умер бы посреди рендера
+        inst_shutdown_file = f"/tmp/gpuraid_shutdown_{session}"
         proc = launch_comfy(comfy_dir, port, gpu, token, extra_args, extra_env={
-            "GPURAID_SHUTDOWN_FILE": shutdown_file,
+            "GPURAID_SHUTDOWN_FILE": inst_shutdown_file,
             "GPURAID_PLATFORM": platform,
             "GPURAID_SESSION": session,
             "GPURAID_MODELS_DIR": models_dir,
@@ -571,7 +611,8 @@ def bring_up(gpuraid_src, comfy_dir, token, gpus=(0,), base_port=8188,
             "index": i, "gpu": gpu, "port": port, "session": session,
             "name": f"{name_prefix}-{i}", "comfy_proc": proc,
             "tunnel_proc": None, "tunnel_port": port, "url": "", "string": "",
-            "restarted": False,
+            "restarted": False, "authproxy_proc": None,
+            "shutdown_file": inst_shutdown_file, "stopped": False,
         })
     for inst in instances:
         port = inst["port"]
@@ -582,7 +623,8 @@ def bring_up(gpuraid_src, comfy_dir, token, gpus=(0,), base_port=8188,
         else:
             print(f"[auth] middleware НЕ активен на :{port} — поднимаю authproxy")
             tunnel_port = port + 10000
-            procs.append(start_authproxy(gpuraid_src, tunnel_port, port, token))
+            inst["authproxy_proc"] = start_authproxy(gpuraid_src, tunnel_port, port, token)
+            procs.append(inst["authproxy_proc"])
         proc, url = start_cloudflared(tunnel_port)
         procs.append(proc)
         inst.update(tunnel_proc=proc, tunnel_port=tunnel_port, url=url,
@@ -606,7 +648,7 @@ def bring_up(gpuraid_src, comfy_dir, token, gpus=(0,), base_port=8188,
         "instances": instances, "platform": platform, "token": token,
         "gist_id": gist_id, "gh_token": gh_token,
         "shutdown_file": shutdown_file, "max_session_min": float(max_session_min or 0),
-        "comfy_dir": comfy_dir, "gpuraid_src": gpuraid_src,
+        "comfy_dir": comfy_dir, "gpuraid_src": gpuraid_src, "models_dir": models_dir,
         "extra_args": tuple(extra_args), "t0": time.time(),
     }
 
@@ -649,19 +691,17 @@ def watchdog(info, interval=15, republish_s=240):
     """Умный keepalive: следит за процессами, туннелями, sentinel'ом и бюджетом.
 
     Выходит (и платформенно гасит рантайм), когда:
-      * мастер прислал POST /gpuraid/worker/shutdown (расширение на воркере
-        пишет sentinel-файл GPURAID_SHUTDOWN_FILE);
+      * мастер прислал POST /gpuraid/worker/shutdown КАЖДОМУ инстансу — sentinel
+        индивидуальный (см. bring_up), поэтому на dual-GPU сессии остановка
+        ОДНОГО инстанса гасит только его; рантайм гасится, когда остановлены ВСЕ;
       * превышен max_session_min (самостраховка на случай смерти мастера).
-    Умерший cloudflared перезапускается, новый URL перепубликуется в gist;
-    умерший ComfyUI перезапускается один раз.
+    Умерший cloudflared/authproxy перезапускается, новый URL перепубликуется
+    в gist; умерший ComfyUI перезапускается один раз.
     """
     reason = ""
     last_publish = time.time()
     try:
         while True:
-            if os.path.isfile(info["shutdown_file"]):
-                reason = "команда мастера"
-                break
             budget = info.get("max_session_min") or 0
             age_min = (time.time() - info["t0"]) / 60.0
             if budget and age_min >= budget:
@@ -669,6 +709,19 @@ def watchdog(info, interval=15, republish_s=240):
                 break
 
             for inst in info["instances"]:
+                if inst["stopped"]:
+                    continue
+                if os.path.isfile(inst["shutdown_file"]):
+                    print(f"[watchdog] {inst['name']} (:{inst['port']}) остановлен мастером")
+                    inst["stopped"] = True
+                    _kill(inst["comfy_proc"])
+                    _kill(inst["tunnel_proc"])
+                    _kill(inst["authproxy_proc"])
+                    publish_rendezvous(info["gh_token"], info["gist_id"], inst["session"],
+                                       inst["name"], info["platform"], inst["string"],
+                                       state="down")
+                    continue
+
                 # ComfyUI умер — одна попытка поднять заново
                 if inst["comfy_proc"].poll() is not None:
                     if inst.get("restarted"):
@@ -680,10 +733,14 @@ def watchdog(info, interval=15, republish_s=240):
                         inst["comfy_proc"] = launch_comfy(
                             info["comfy_dir"], inst["port"], inst["gpu"], info["token"],
                             info["extra_args"], extra_env={
-                                "GPURAID_SHUTDOWN_FILE": info["shutdown_file"],
+                                "GPURAID_SHUTDOWN_FILE": inst["shutdown_file"],
                                 "GPURAID_PLATFORM": info["platform"],
                                 "GPURAID_SESSION": inst["session"],
+                                # без этого перезапущенный ComfyUI на Kaggle льёт
+                                # модели в 20-ГБ /kaggle/working вместо /kaggle/tmp
+                                "GPURAID_MODELS_DIR": info.get("models_dir", ""),
                             })
+                        info["procs"].append(inst["comfy_proc"])
                         try:
                             wait_ready(inst["port"])
                         except RuntimeError as e:
@@ -698,23 +755,45 @@ def watchdog(info, interval=15, republish_s=240):
                         continue
                     inst.update(tunnel_proc=proc, url=url,
                                 string=connection_string(info["token"], url, inst["name"]))
+                    info["procs"].append(proc)
                     publish_rendezvous(info["gh_token"], info["gist_id"], inst["session"],
                                        inst["name"], info["platform"], inst["string"])
                     last_publish = time.time()
+                # authproxy умер (fallback, когда middleware не встал) — держит
+                # единственный публичный вход в туннель; без монитора умерший
+                # authproxy оставляет живой, но бесполезный туннель (502 на
+                # каждый запрос), и воркер тихо выпадает без строки в логе
+                if inst["authproxy_proc"] is not None and inst["authproxy_proc"].poll() is not None:
+                    print(f"[watchdog] authproxy :{inst['tunnel_port']} умер — перезапускаю")
+                    inst["authproxy_proc"] = start_authproxy(
+                        info["gpuraid_src"], inst["tunnel_port"], inst["port"], info["token"])
+                    info["procs"].append(inst["authproxy_proc"])
+
+            if info["instances"] and all(inst["stopped"] for inst in info["instances"]):
+                reason = "команда мастера (все инстансы остановлены)"
+                break
 
             # периодическая перепубликация = heartbeat для rendezvous (TTL 10 мин)
             if time.time() - last_publish >= republish_s:
                 for inst in info["instances"]:
-                    publish_rendezvous(info["gh_token"], info["gist_id"], inst["session"],
-                                       inst["name"], info["platform"], inst["string"])
+                    if not inst["stopped"]:
+                        publish_rendezvous(info["gh_token"], info["gist_id"], inst["session"],
+                                           inst["name"], info["platform"], inst["string"])
                 last_publish = time.time()
             time.sleep(interval)
     except KeyboardInterrupt:
         reason = "остановлено вручную"
     print(f"[watchdog] завершение: {reason}")
     for inst in info["instances"]:
-        publish_rendezvous(info["gh_token"], info["gist_id"], inst["session"],
-                           inst["name"], info["platform"], inst["string"], state="down")
+        if not inst["stopped"]:
+            publish_rendezvous(info["gh_token"], info["gist_id"], inst["session"],
+                               inst["name"], info["platform"], inst["string"], state="down")
+        # перезапущенные watchdog'ом comfy/туннель/authproxy живут ТОЛЬКО в
+        # inst — оригиналы в info["procs"] уже мертвы (это они и вызвали
+        # перезапуск), их _kill молча no-op'ает; добиваем актуальные по инстансам
+        _kill(inst["comfy_proc"])
+        _kill(inst["tunnel_proc"])
+        _kill(inst["authproxy_proc"])
     for proc in info["procs"]:
         _kill(proc)
     platform_shutdown(info["platform"])

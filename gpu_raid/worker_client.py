@@ -279,6 +279,13 @@ class WorkerClient:
         return await asyncio.to_thread(
             self._download_blocking, self.url + "/view?" + query, dest_path, 180)
 
+    # щедрый потолок для offload/longvideo (video-выход может тянуть на ГБ),
+    # но не бесконечность: полудоверенный (или скомпрометированный) воркер не
+    # должен иметь возможность залить диск мастера бесконечным ответом на /view.
+    # Обрыв связи ДО заявленного Content-Length http.client ловит сам
+    # (IncompleteRead) — здесь только защита от НЕограниченного потока.
+    _MAX_VIEW_BYTES = 8 * (1 << 30)
+
     def _download_blocking(self, url, dest_path, timeout):
         """Тело файла тянет stdlib-клиент — почему не aiohttp, см. download_view."""
         import urllib.error
@@ -287,15 +294,31 @@ class WorkerClient:
         os.makedirs(os.path.dirname(dest_path), exist_ok=True)
         tmp = dest_path + ".part"
         req = urllib.request.Request(url, headers=self._headers())
+        oversized = False
         try:
             with urllib.request.urlopen(req, timeout=timeout) as r, open(tmp, "wb") as f:
+                written = 0
                 while True:
                     chunk = r.read(1 << 20)
                     if not chunk:
                         break
+                    written += len(chunk)
+                    if written > self._MAX_VIEW_BYTES:
+                        # выходим из with ДО удаления файла — Windows не даёт
+                        # снести файл под открытым дескриптором
+                        oversized = True
+                        break
                     f.write(chunk)
         except urllib.error.HTTPError as e:
             raise SubmitError(f"/view: HTTP {e.code}") from e
+        if oversized:
+            try:
+                os.remove(tmp)
+            except OSError:
+                pass
+            raise SubmitError(
+                f"/view: тело больше {self._MAX_VIEW_BYTES // (1 << 30)} ГБ — "
+                "воркер шлёт подозрительно много, обрываю")
         os.replace(tmp, dest_path)
         return dest_path
 

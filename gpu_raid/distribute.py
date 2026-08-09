@@ -20,6 +20,10 @@ CLASSES_TTL_S = 600
 # ключ f"{worker_id}|{folder}/{filename}" -> запись о запущенной закачке
 TASKS = {}
 _CLASSES = {}   # worker_id -> (ts, set(classes))
+# сколько терпеть подряд идущий "unknown" (сессия воркера могла на секунды
+# пропасть при рестарте туннеля/ComfyUI watchdog'ом), прежде чем считать
+# закачку потерянной вместе с сессией — не завершившейся тихо навсегда
+UNKNOWN_TIMEOUT_S = 90
 
 
 def _flat(names):
@@ -164,16 +168,22 @@ async def start(items):
             live = TASKS.get(key)
             if live and live.get("state") in ("starting", "downloading"):
                 continue      # уже качается — второй раз не запускаем
+            # резервируем слот ДО await: _start_one — полный раунд через
+            # туннель (секунды), и без резерва два конкурентных POST (две
+            # вкладки панели, ретрай после ошибки) проходят проверку выше
+            # одновременно и оба стартуют закачку одного файла
+            TASKS[key] = {
+                "worker_id": wid, "worker": record["name"], "folder": folder,
+                "filename": filename, "task_id": None, "state": "starting",
+                "bytes_done": 0, "bytes_total": 0, "error": "", "started": time.time(),
+            }
             try:
                 task_id = await _start_one(record, folder, filename, url)
             except Exception as e:
                 errors.append(f"{filename} → {record['name']}: {e}")
+                TASKS.pop(key, None)     # откатываем резерв — слот не должен виснуть навсегда
                 continue
-            TASKS[key] = {
-                "worker_id": wid, "worker": record["name"], "folder": folder,
-                "filename": filename, "task_id": task_id, "state": "starting",
-                "bytes_done": 0, "bytes_total": 0, "error": "", "started": time.time(),
-            }
+            TASKS[key]["task_id"] = task_id
             started.append(dict(TASKS[key]))
     return {"started": started, "errors": errors}
 
@@ -203,8 +213,25 @@ async def progress():
                 status = await REGISTRY.client(record).download_status(task["task_id"]) or {}
         except Exception as e:
             status = {"state": "unknown", "error": str(e)}
+        new_state = status.get("state", task["state"])
+        if new_state == "unknown":
+            # is_downloading() для unknown уже отдаёт False (lifecycle воркера
+            # не защищает), но САМА задача не терминальна — без таймаута висит
+            # в UI вечно без прогресса и без ошибки, пока сессия воркера
+            # (Kaggle/Colab) умерла вместе с закачкой
+            since = task.get("unknown_since") or time.time()
+            task["unknown_since"] = since
+            if time.time() - since > UNKNOWN_TIMEOUT_S:
+                task.update(state="error",
+                            error="воркер перезапущен — закачка потеряна, запустите снова",
+                            finished=time.time())
+                _CLASSES.pop(task["worker_id"], None)
+                out.append(task)
+                continue
+        else:
+            task.pop("unknown_since", None)
         task.update({
-            "state": status.get("state", task["state"]),
+            "state": new_state,
             "bytes_done": status.get("bytes_done", task["bytes_done"]),
             "bytes_total": status.get("bytes_total", task["bytes_total"]),
             "error": status.get("error", ""),

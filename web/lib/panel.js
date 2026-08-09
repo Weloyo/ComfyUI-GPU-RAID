@@ -73,8 +73,22 @@ export class GPURaidPanel {
             this.workers = w.workers || [];
             this.settings = s.settings || w.settings || {};
             this.secretsView = s.secrets || {};
+            const activeIds = new Set((j.active || []).map((snap) => snap.job_id));
             for (const snap of j.active || []) this.jobs.set(snap.job_id, snap);
             this.history = j.history || this.history;
+            // реконсиляция: job, которого больше нет в active и который ещё не
+            // помечен finished, — зомби (WS-событие job_done потерялось,
+            // например, при реконнекте без реплея). Не полагаемся только на
+            // WS — подхватываем сами, тем же путём (снапшот из history, если
+            // найдётся, + отложенное удаление через 15с для консистентности с
+            // онEvent('job_done')), но без повторной вставки в history.
+            for (const [jobId, job] of this.jobs) {
+                if (activeIds.has(jobId) || job.finished) continue;
+                const hist = this.history.find((h) => h.job_id === jobId);
+                if (hist) Object.assign(job, hist);
+                job.finished = true;
+                setTimeout(() => { this.jobs.delete(jobId); this.renderJobs(); }, 15000);
+            }
             this.renderModes();
             this.renderWorkers();
             this.renderJobs();

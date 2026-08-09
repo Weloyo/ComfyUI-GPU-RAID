@@ -263,7 +263,12 @@ async def _run_pipeline(job):
         MANAGER._archive(job)
         if job.finished == "COMPLETE":
             events.toast("success", f"Pipeline «{job.label}»: готово → {job.outdir}")
-            # бандлы больше не нужны — чистим мастерский input
-            shutil.rmtree(os.path.join(folder_paths.get_input_directory(),
-                                       "gpuraid_bundle", job.job_id),
-                          ignore_errors=True)
+        # бандлы больше не нужны НЕЗАВИСИМО от исхода — раньше чистка была
+        # только при COMPLETE, и FAILED/PARTIAL/CANCELLED оставляли
+        # input/gpuraid_bundle/<job_id> на диске навсегда (не покрыт
+        # results.gc_jobs — тот чистит только output/gpuraid_tmp). rmtree — в
+        # поток, не на event loop
+        await asyncio.to_thread(
+            shutil.rmtree,
+            os.path.join(folder_paths.get_input_directory(), "gpuraid_bundle", job.job_id),
+            ignore_errors=True)

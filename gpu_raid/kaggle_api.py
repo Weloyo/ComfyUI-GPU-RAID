@@ -51,10 +51,14 @@ def _cli():
 
 def _env():
     env = dict(os.environ)
-    env["KAGGLE_CONFIG_DIR"] = config.state_dir()   # старая схема: kaggle.json
+    # схемы взаимоисключающи: при сохранённом токене НЕ выставляем
+    # KAGGLE_CONFIG_DIR, иначе поведение CLI зависит от порядка разрешения
+    # кредов в его версии (мог бы подхватить старый kaggle.json)
     token = secret_store.get("kaggle_token")
     if token:
         env["KAGGLE_API_TOKEN"] = token             # новая схема: строка KGAT_…
+    else:
+        env["KAGGLE_CONFIG_DIR"] = config.state_dir()   # старая схема: kaggle.json
     return env
 
 

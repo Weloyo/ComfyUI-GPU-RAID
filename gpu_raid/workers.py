@@ -196,7 +196,9 @@ class WorkerRegistry:
         if "add_remap" in patch:
             add = patch["add_remap"]  # {folder, master, worker}
             w.setdefault("model_remap", {}).setdefault(add["folder"], {})[add["master"]] = add["worker"]
-        self._clients.pop(worker_id, None)  # url/token могли смениться
+        old = self._clients.pop(worker_id, None)  # url/token могли смениться
+        if old is not None:
+            await old.close()
         await self._save()
         return w
 
@@ -207,7 +209,9 @@ class WorkerRegistry:
         before = len(data["workers"])
         gone = [w for w in data["workers"] if w["id"] == worker_id]
         data["workers"] = [w for w in data["workers"] if w["id"] != worker_id]
-        self._clients.pop(worker_id, None)
+        old = self._clients.pop(worker_id, None)
+        if old is not None:
+            await old.close()
         self.status.pop(worker_id, None)
         if len(data["workers"]) == before:
             return False
@@ -239,9 +243,27 @@ class WorkerRegistry:
         wid = record["id"]
         cached = self._clients.get(wid)
         if cached is None or cached.url != record["url"].rstrip("/") or cached.token != (record.get("token") or ""):
+            if cached is not None:
+                self._schedule_close(cached)
             cached = WorkerClient(wid, record["url"], record.get("token") or "")
             self._clients[wid] = cached
         return cached
+
+    def _schedule_close(self, wc):
+        """Закрыть ClientSession выброшенного клиента в фоне (client() синхронный).
+
+        Каждый перезапуск Colab/Kaggle-туннеля через rendezvous меняет url
+        воркера и выбрасывает старый WorkerClient здесь; без явного close()
+        его лениво созданная aiohttp.ClientSession остаётся открытой до
+        сборки мусора — за долгую сессию мастера копятся незакрытые
+        соединения ("Unclosed client session" в логе, сокеты в CLOSE_WAIT).
+        """
+        try:
+            from server import PromptServer
+
+            PromptServer.instance.loop.create_task(wc.close())
+        except Exception:
+            log.debug("worker client close scheduling failed", exc_info=True)
 
     def enabled_records(self):
         return [w for w in self.records() if w.get("enabled")]

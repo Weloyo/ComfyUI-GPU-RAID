@@ -15,6 +15,8 @@ from urllib.parse import urlsplit
 import aiohttp
 import folder_paths
 
+from . import config
+
 log = logging.getLogger("gpu_raid")
 
 # запас поверх размера файла: рядом лежит .part, а платформе нужно место под свои
@@ -122,9 +124,12 @@ async def _run(task_id, folder, url, filename, hf_token, civitai_token):
         dest_dir, link_dir = _dirs(folder)
         headers = {}
         host = (urlsplit(url).hostname or "").lower()
-        if hf_token and "huggingface.co" in host:
+        # Токен цепляем ТОЛЬКО к точному хосту (или его поддомену): подстрочная
+        # проверка уносила бы Bearer на huggingface.co.evil.com/resolve/…
+        if hf_token and (host == "huggingface.co" or host.endswith(".huggingface.co")):
             headers["Authorization"] = f"Bearer {hf_token}"
-        if civitai_token and "civitai.com" in host and "token=" not in url:
+        if (civitai_token and (host == "civitai.com" or host.endswith(".civitai.com"))
+                and "token=" not in url):
             url += ("&" if "?" in url else "?") + "token=" + civitai_token
 
         dest = os.path.join(dest_dir, filename)
@@ -162,7 +167,19 @@ async def _run(task_id, folder, url, filename, hf_token, civitai_token):
 
 
 def start(loop, folder, url, filename=None, hf_token=None, civitai_token=None):
-    filename = filename or _guess_filename(url)
+    # filename недоверенный (тело запроса) — режем до базового имени, иначе
+    # '../…' писал бы модель за пределы каталога моделей
+    filename = config.safe_filename(filename or _guess_filename(url))
+    # дедуп по (folder, filename): без него два конкурентных вызова (обходной
+    # путь мимо distribute.TASKS — например, повторный клик по «Скачать на
+    # воркера» или прямой POST /gpuraid/download_model) льют в один .part
+    # независимыми хендлами (wb/ab) — смешанный мусор публикуется как done без
+    # проверки целостности. Функция синхронная — между проверкой и записью в
+    # TASKS нет await, гонки на этом event loop'е нет.
+    for existing_id, t in TASKS.items():
+        if (t.get("folder") == folder and t.get("filename") == filename
+                and t.get("state") in ("starting", "downloading")):
+            return existing_id
     task_id = uuid.uuid4().hex[:12]
     TASKS[task_id] = {
         "state": "starting", "bytes_done": 0, "bytes_total": 0,
