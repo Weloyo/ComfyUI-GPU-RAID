@@ -51,6 +51,35 @@ def gen_token(token=""):
     return token.strip() or secrets.token_urlsafe(18)
 
 
+def on_kaggle():
+    """Физический признак Kaggle: рабочий каталог с лимитом 20 ГБ.
+
+    Отдельно от platform_detect намеренно. Решения «куда писать» должны
+    опираться на факт, а не на ярлык: ярлык уже трижды оказывался неверным, и
+    каждый раз это стоило либо автостопа, либо переполнения диска. У Colab
+    каталог /kaggle если и есть, то пустой — рабочего подкаталога там не бывает.
+    """
+    return os.path.isdir("/kaggle/working")
+
+
+def detection_evidence():
+    """Улики для лога: почему платформа определилась именно так.
+
+    Живьём детектор ошибался трижды, и каждый раз разбор начинался с догадок о
+    том, что было в окружении. Пусть кернел сам это печатает.
+    """
+    env = sorted(k for k in os.environ if k.startswith(("COLAB_", "KAGGLE_")))
+    try:
+        import importlib.util
+
+        colab_mod = importlib.util.find_spec("google.colab") is not None
+    except Exception:
+        colab_mod = "?"
+    return (f"env={env or '—'} /kaggle/working={os.path.isdir('/kaggle/working')} "
+            f"/kaggle/input={os.path.isdir('/kaggle/input')} "
+            f"google.colab={colab_mod} /content/drive={os.path.isdir('/content/drive')}")
+
+
 def platform_detect():
     """Где мы работаем: colab | kaggle | generic.
 
@@ -332,8 +361,9 @@ def scratch_args(platform):
     а кадры/промежуточные файлы чисто транзитные. Уводим их в эфемерный /kaggle/tmp
     (на Colab — в /content/gpuraid_scratch), в рабочем каталоге остаётся только код.
     """
-    base = {"kaggle": "/kaggle/tmp/gpuraid_scratch",
-            "colab": "/content/gpuraid_scratch"}.get(platform)
+    base = "/kaggle/tmp/gpuraid_scratch" if on_kaggle() else {
+        "kaggle": "/kaggle/tmp/gpuraid_scratch",
+        "colab": "/content/gpuraid_scratch"}.get(platform)
     if not base:
         return ()
     args = []
@@ -356,7 +386,7 @@ def models_scratch(platform):
     а в models/ остаётся symlink (так же, как делает hf_download с HF-кэшем).
     На Colab каталог рантайма и так на большом диске — трогать нечего.
     """
-    base = {"kaggle": "/kaggle/tmp/gpuraid_models"}.get(platform)
+    base = "/kaggle/tmp/gpuraid_models" if (on_kaggle() or platform == "kaggle") else ""
     if not base:
         return ""
     os.makedirs(base, exist_ok=True)
@@ -517,6 +547,7 @@ def bring_up(gpuraid_src, comfy_dir, token, gpus=(0,), base_port=8188,
         print("! ffmpeg не найден — VHS_VideoCombine может не работать")
 
     platform = platform_detect()
+    print(f"[platform] определено: {platform} | {detection_evidence()}")
     extra_args = tuple(extra_args) + scratch_args(platform)
     models_dir = models_scratch(platform)
     session_base = secrets.token_hex(4)
