@@ -135,6 +135,8 @@ class Rendezvous:
         from .workers import REGISTRY, parse_connection_string
 
         session = str(entry["session"])
+        if REGISTRY.is_dismissed(session):
+            return          # воркера удалили руками — не воскрешаем
         try:
             parsed = parse_connection_string(entry["string"])
         except ValueError:

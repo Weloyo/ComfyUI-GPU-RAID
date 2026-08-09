@@ -20,6 +20,33 @@ export function stateDot(state) {
     return map[state] || "gr-dot-gray";
 }
 
+const STATE_TEXT = {
+    online: "в работе",
+    offline: "недоступен",
+    stopped: "остановлен",
+    unknown: "не опрошен",
+};
+
+export function stateText(state, enabled = true) {
+    if (!enabled) return "выключен";
+    return STATE_TEXT[state] || (state ? String(state) : "не опрошен");
+}
+
+/** Ошибка воркера человеческим языком: голое имя исключения ничего не говорит. */
+export function workerError(error, state) {
+    const text = String(error || "");
+    if (!text) return "";
+    if (/DNSError|Cannot connect to host|ClientConnectorError/i.test(text)) {
+        return "туннель не отвечает — сессия на платформе завершена";
+    }
+    if (/530/.test(text)) {
+        return "туннель жив, но за ним никого нет — воркер остановлен";
+    }
+    if (/401/.test(text)) return "неверный токен воркера";
+    if (/TimeoutError/i.test(text)) return "нет ответа вовремя";
+    return text.replace(/^[A-Za-z]+Error:\s*/, "");
+}
+
 export function platformBadge(platform) {
     const map = { colab: "колаб", kaggle: "каггл", generic: "облако" };
     return map[platform] || "";

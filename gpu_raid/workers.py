@@ -205,13 +205,30 @@ class WorkerRegistry:
             return False
         data = self._ensure_loaded()
         before = len(data["workers"])
+        gone = [w for w in data["workers"] if w["id"] == worker_id]
         data["workers"] = [w for w in data["workers"] if w["id"] != worker_id]
         self._clients.pop(worker_id, None)
         self.status.pop(worker_id, None)
-        if len(data["workers"]) != before:
-            await self._save()
-            return True
-        return False
+        if len(data["workers"]) == before:
+            return False
+        # удалённую сессию помним: её запись может быть ещё жива в гисте, и
+        # rendezvous добавил бы воркера обратно (уже под новым id) — со стороны
+        # это выглядит как «удаление не работает»
+        for record in gone:
+            session = str(record.get("session") or "")
+            if session:
+                dismissed = data.setdefault("dismissed_sessions", [])
+                if session not in dismissed:
+                    dismissed.append(session)
+                del dismissed[:-50]
+        await self._save()
+        return True
+
+    def is_dismissed(self, session):
+        session = str(session or "")
+        if not session:
+            return False
+        return session in (self._ensure_loaded().get("dismissed_sessions") or [])
 
     # ---------------- клиенты и статусы ----------------
 

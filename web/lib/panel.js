@@ -5,7 +5,8 @@
 // Здесь остаётся только то, что применяется ко всему workflow целиком.
 import { app } from "../../../scripts/app.js";
 import { gr, toast } from "./api.js";
-import { el, esc, fmtDur, fmtGb, platformBadge, stateDot } from "./format.js";
+import { el, esc, fmtDur, fmtGb, platformBadge, stateDot, stateText, workerError }
+    from "./format.js";
 import { openProjectOnCanvas } from "./nodeui.js";
 import { ConnectionsUI } from "./connections.js";
 import { ModelLibraryUI } from "./models.js";
@@ -242,18 +243,33 @@ export class GPURaidPanel {
                     ? (st.state === "stopped" ? "остановлен (lifecycle)" : (st.state || ""))
                     : "выключен: задания не получает",
             }));
-            head.appendChild(el("span", { class: "gr-name", title: w.url }, esc(w.name)));
-            if (!w.enabled) head.appendChild(el("span", { class: "gr-badge" }, "выкл"));
+            // сессию показываем, когда имён-близнецов несколько (Colab/Kaggle
+            // называют воркеров одинаково, и две строки становятся неразличимы)
+            const twins = this.workers.filter((x) => x.name === w.name).length > 1;
+            head.appendChild(el("span", { class: "gr-name", title: w.url },
+                esc(w.name) + (twins && w.session ? ` · ${esc(String(w.session).slice(0, 6))}` : "")));
+            head.appendChild(el("span", { class: "gr-badge" },
+                esc(stateText(st.state, w.enabled))));
             const badge = platformBadge(w.platform || st.platform ||
                 (w.kind === "cloud" ? "generic" : ""));
             if (badge) head.appendChild(el("span", { class: "gr-badge" }, esc(badge)));
-            const gpu = st.gpu ? `${st.gpu} · ${fmtGb(st.vram_total_gb)}` : (st.error ? esc(st.error) : "");
+            const problem = workerError(st.error, st.state);
+            const gpu = st.gpu ? `${st.gpu} · ${fmtGb(st.vram_total_gb)}` : "";
             head.appendChild(el("span", { class: "gr-muted gr-grow" },
-                esc(gpu) + (st.latency_ms != null ? ` · ${st.latency_ms}мс` : "")));
+                esc(gpu) + (st.latency_ms != null && st.state === "online"
+                    ? ` · ${st.latency_ms}мс` : "")));
             const chip = this.parity.get(w.id);
             if (chip) head.appendChild(el("span", { class: `gr-chip gr-chip-${chip.level}`,
                 title: (chip.notes || []).join("\n") }, chip.level === "green" ? "готов" : chip.level));
             row.appendChild(head);
+            if (problem) {
+                row.appendChild(el("div", { class: "gr-muted" }, `↳ ${esc(problem)}`));
+            }
+            if (st.state === "stopped") {
+                row.appendChild(el("div", { class: "gr-muted" },
+                    "↳ остановлен командой мастера (кнопка ⏻ или автостоп). "
+                    + "Чтобы поднять — запустите ноутбук на платформе заново."));
+            }
 
             const btns = el("div", { class: "gr-btns" });
             const toggle = el("button", { class: "gr-btn" }, w.enabled ? "Выкл" : "Вкл");
