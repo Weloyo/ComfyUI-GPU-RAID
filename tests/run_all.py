@@ -23,10 +23,12 @@ import test_providers  # noqa: E402
 import test_rendezvous  # noqa: E402
 import test_storyplan  # noqa: E402
 import test_worker_bootstrap  # noqa: E402
+import test_worker_client  # noqa: E402
 
 MODULES = [test_bundle, test_downloads, test_graph_rewrite, test_lifecycle_rules,
            test_modelsrc, test_parity, test_pipeline_split, test_providers,
-           test_rendezvous, test_storyplan, test_worker_bootstrap]
+           test_rendezvous, test_storyplan, test_worker_bootstrap,
+           test_worker_client]
 
 
 def main():

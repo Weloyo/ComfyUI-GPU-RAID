@@ -24,6 +24,44 @@ class SubmitError(Exception):
         self.status = status
 
 
+class _MultipartStream:
+    """head + содержимое файла + tail как один поток для urllib.
+
+    Нужен, чтобы не собирать тело запроса в памяти: файлы бывают под сотню
+    мегабайт. urllib читает `read(n)`, поэтому больше ничего и не требуется.
+    """
+
+    HEAD, FILE, TAIL, DONE = 0, 1, 2, 3
+
+    def __init__(self, head, fileobj, tail):
+        self._head, self._file, self._tail = head, fileobj, tail
+        self._stage = self.HEAD
+        self._buf = b""
+
+    def read(self, size=-1):
+        want = size if size and size > 0 else 1 << 20
+        out = bytearray()
+        while len(out) < want:
+            if self._buf:
+                take = want - len(out)
+                out += self._buf[:take]
+                self._buf = self._buf[take:]
+                continue
+            if self._stage == self.HEAD:
+                self._buf, self._stage = self._head, self.FILE
+            elif self._stage == self.FILE:
+                chunk = self._file.read(want)
+                if chunk:
+                    self._buf = chunk
+                else:
+                    self._stage = self.TAIL
+            elif self._stage == self.TAIL:
+                self._buf, self._stage = self._tail, self.DONE
+            else:
+                break
+        return bytes(out)
+
+
 class WorkerClient:
     def __init__(self, worker_id, url, token=""):
         self.worker_id = worker_id
@@ -126,27 +164,53 @@ class WorkerClient:
         except Exception:
             return None
 
+    def _upload_blocking(self, local_path, remote_name, subfolder, timeout):
+        """multipart вручную и stdlib-клиентом — по той же причине, что в
+        download_view: aiohttp на мегабайтном теле через туннель рвёт
+        соединение («WinError 64»), stdlib кладёт тот же файл за 7 с.
+
+        Тело не собирается в памяти целиком: бандлы шардинга бывают под сотню
+        мегабайт, а держать их копию в RAM мастера незачем.
+        """
+        import urllib.error
+        import urllib.request
+        import uuid
+
+        boundary = "----gpuraid" + uuid.uuid4().hex
+
+        def field(name, value):
+            return (f"--{boundary}\r\nContent-Disposition: form-data; "
+                    f'name="{name}"\r\n\r\n{value}\r\n').encode()
+
+        head = (field("subfolder", subfolder) + field("type", "input")
+                + field("overwrite", "true")
+                + (f"--{boundary}\r\nContent-Disposition: form-data; name=\"image\"; "
+                   f'filename="{remote_name}"\r\n'
+                   "Content-Type: application/octet-stream\r\n\r\n").encode())
+        tail = f"\r\n--{boundary}--\r\n".encode()
+        size = os.path.getsize(local_path)
+
+        with open(local_path, "rb") as f:
+            body = _MultipartStream(head, f, tail)
+            req = urllib.request.Request(
+                self.url + "/upload/image", data=body, method="POST",
+                headers={**self._headers(),
+                         "Content-Type": f"multipart/form-data; boundary={boundary}",
+                         "Content-Length": str(len(head) + size + len(tail))})
+            try:
+                with urllib.request.urlopen(req, timeout=timeout) as r:
+                    return json.loads(r.read().decode("utf-8", "replace") or "{}")
+            except urllib.error.HTTPError as e:
+                if e.code == 401:
+                    raise SubmitError("401: неверный токен воркера", status=401) from e
+                text = e.read()[:300].decode("utf-8", "replace")
+                raise SubmitError(f"upload {remote_name}: HTTP {e.code} {text}") from e
+
     async def upload_file(self, local_path, remote_name=None, subfolder="gpuraid"):
         """POST /upload/image (принимает любой файл). Возвращает значение для входа ноды."""
         remote_name = remote_name or os.path.basename(local_path)
-        s = await self.session()
-        with open(local_path, "rb") as f:
-            form = aiohttp.FormData()
-            form.add_field("image", f, filename=remote_name,
-                           content_type="application/octet-stream")
-            form.add_field("subfolder", subfolder)
-            form.add_field("type", "input")
-            form.add_field("overwrite", "true")
-            async with s.post(
-                self.url + "/upload/image", data=form,
-                timeout=aiohttp.ClientTimeout(total=600),
-            ) as r:
-                if r.status == 401:
-                    raise SubmitError("401: неверный токен воркера", status=401)
-                if r.status != 200:
-                    text = (await r.text())[:300]
-                    raise SubmitError(f"upload {remote_name}: HTTP {r.status} {text}")
-                data = await r.json()
+        data = await asyncio.to_thread(
+            self._upload_blocking, local_path, remote_name, subfolder, 600)
         sub = data.get("subfolder") or subfolder
         name = data.get("name") or remote_name
         return f"{sub}/{name}" if sub else name
@@ -192,7 +256,19 @@ class WorkerClient:
         return {"running": ids(data.get("queue_running")), "pending": ids(data.get("queue_pending"))}
 
     async def download_view(self, fileref, dest_path):
-        """fileref: {filename, subfolder, type} -> скачивает в dest_path (стримом)."""
+        """fileref: {filename, subfolder, type} -> скачивает в dest_path.
+
+        Тело тянет БЛОКИРУЮЩИЙ stdlib-клиент в отдельном потоке, а не aiohttp.
+        Причина найдена экспериментом (2026-08-09, живой Kaggle-воркер за
+        бесплатным cloudflared): aiohttp получает заголовки и верный
+        Content-Length, принимает ~1.4 КБ тела и встаёт намертво до таймаута.
+        Не зависит от keep-alive, User-Agent, Accept-Encoding, семейства
+        адресов и типа event loop; тот же файл stdlib качает за 2 с, а тот же
+        aiohttp из того же процесса тянет 4 МБ с huggingface за 6 с — ломается
+        именно связка «aiohttp + туннель» (родня уже известной поломки
+        keep-alive там же). Результат обязан вернуться, поэтому здесь
+        надёжность важнее единообразия клиента.
+        """
         from urllib.parse import urlencode
 
         query = urlencode({
@@ -200,18 +276,26 @@ class WorkerClient:
             "subfolder": fileref.get("subfolder", "") or "",
             "type": fileref.get("type", "output") or "output",
         })
-        s = await self.session()
+        return await asyncio.to_thread(
+            self._download_blocking, self.url + "/view?" + query, dest_path, 180)
+
+    def _download_blocking(self, url, dest_path, timeout):
+        """Тело файла тянет stdlib-клиент — почему не aiohttp, см. download_view."""
+        import urllib.error
+        import urllib.request
+
         os.makedirs(os.path.dirname(dest_path), exist_ok=True)
         tmp = dest_path + ".part"
-        async with s.get(
-            self.url + "/view?" + query,
-            timeout=aiohttp.ClientTimeout(total=None, sock_read=180),
-        ) as r:
-            if r.status != 200:
-                raise SubmitError(f"/view {fileref.get('filename')}: HTTP {r.status}")
-            with open(tmp, "wb") as f:
-                async for chunk in r.content.iter_chunked(1 << 20):
+        req = urllib.request.Request(url, headers=self._headers())
+        try:
+            with urllib.request.urlopen(req, timeout=timeout) as r, open(tmp, "wb") as f:
+                while True:
+                    chunk = r.read(1 << 20)
+                    if not chunk:
+                        break
                     f.write(chunk)
+        except urllib.error.HTTPError as e:
+            raise SubmitError(f"/view: HTTP {e.code}") from e
         os.replace(tmp, dest_path)
         return dest_path
 
