@@ -13,6 +13,7 @@ sys.path.insert(0, _TESTS)
 sys.path.insert(0, os.path.dirname(_TESTS))
 
 import test_bundle  # noqa: E402
+import test_downloads  # noqa: E402
 import test_graph_rewrite  # noqa: E402
 import test_lifecycle_rules  # noqa: E402
 import test_modelsrc  # noqa: E402
@@ -23,9 +24,9 @@ import test_rendezvous  # noqa: E402
 import test_storyplan  # noqa: E402
 import test_worker_bootstrap  # noqa: E402
 
-MODULES = [test_bundle, test_graph_rewrite, test_lifecycle_rules, test_modelsrc,
-           test_parity, test_pipeline_split, test_providers, test_rendezvous,
-           test_storyplan, test_worker_bootstrap]
+MODULES = [test_bundle, test_downloads, test_graph_rewrite, test_lifecycle_rules,
+           test_modelsrc, test_parity, test_pipeline_split, test_providers,
+           test_rendezvous, test_storyplan, test_worker_bootstrap]
 
 
 def main():

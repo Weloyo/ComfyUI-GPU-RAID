@@ -61,6 +61,19 @@ def test_plain_machine_is_generic():
     assert _detect({"/home/user", "/tmp"}) == "generic"
 
 
+def test_models_scratch_only_where_working_dir_is_capped():
+    """Kaggle держит ComfyUI в /kaggle/working с лимитом 20 ГБ — один набор
+    моделей его переполняет, поэтому веса уезжают на эфемерный диск."""
+    real = os.makedirs
+    os.makedirs = lambda *a, **kw: None
+    try:
+        assert wb.models_scratch("kaggle") == "/kaggle/tmp/gpuraid_models"
+        assert wb.models_scratch("colab") == ""      # /content и так большой
+        assert wb.models_scratch("generic") == ""
+    finally:
+        os.makedirs = real
+
+
 def test_gen_token_is_random_and_urlsafe():
     a, b = wb.gen_token(""), wb.gen_token("")
     assert a != b and len(a) >= 16

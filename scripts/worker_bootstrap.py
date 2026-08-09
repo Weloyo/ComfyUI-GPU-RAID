@@ -333,6 +333,23 @@ def scratch_args(platform):
     return tuple(args)
 
 
+def models_scratch(platform):
+    """Куда воркеру складывать скачанные по кнопке модели. '' = в свой models/.
+
+    Отдельно от scratch_args: там транзитные кадры, здесь десятки гигабайт
+    весов. На Kaggle `/kaggle/working` (где стоит ComfyUI) ограничен 20 ГБ —
+    один набор моделей его переполняет, поэтому веса уезжают на эфемерный диск,
+    а в models/ остаётся symlink (так же, как делает hf_download с HF-кэшем).
+    На Colab каталог рантайма и так на большом диске — трогать нечего.
+    """
+    base = {"kaggle": "/kaggle/tmp/gpuraid_models"}.get(platform)
+    if not base:
+        return ""
+    os.makedirs(base, exist_ok=True)
+    print(f"[models] загрузки по кнопке уедут на эфемерный диск: {base}")
+    return base
+
+
 def launch_comfy(comfy_dir, port, cuda_device, token, extra_args=(), log_path=None,
                  extra_env=None):
     env = dict(os.environ)
@@ -486,6 +503,7 @@ def bring_up(gpuraid_src, comfy_dir, token, gpus=(0,), base_port=8188,
 
     platform = platform_detect()
     extra_args = tuple(extra_args) + scratch_args(platform)
+    models_dir = models_scratch(platform)
     session_base = secrets.token_hex(4)
     shutdown_file = f"/tmp/gpuraid_shutdown_{session_base}"
 
@@ -497,6 +515,7 @@ def bring_up(gpuraid_src, comfy_dir, token, gpus=(0,), base_port=8188,
             "GPURAID_SHUTDOWN_FILE": shutdown_file,
             "GPURAID_PLATFORM": platform,
             "GPURAID_SESSION": session,
+            "GPURAID_MODELS_DIR": models_dir,
         })
         procs.append(proc)
         instances.append({
