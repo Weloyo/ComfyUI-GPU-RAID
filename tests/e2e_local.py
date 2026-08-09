@@ -60,8 +60,11 @@ def spawn(port, env_extra, user_dir):
     os.makedirs(user_dir, exist_ok=True)
     log = open(os.path.join(os.path.dirname(__file__), f"e2e_{port}.log"), "wb")
     return subprocess.Popen(
+        # --disable-auto-launch: тестовый инстанс не должен открывать браузер
+        # пользователю (под токеном он всё равно ответит «unauthorized»)
         [PY, "-s", MAIN, "--windows-standalone-build", "--port", str(port),
-         "--listen", "127.0.0.1", "--cpu", "--user-directory", user_dir],
+         "--listen", "127.0.0.1", "--cpu", "--disable-auto-launch",
+         "--user-directory", user_dir],
         cwd=COMFY, env=env, stdout=log, stderr=subprocess.STDOUT,
     )
 

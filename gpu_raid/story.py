@@ -104,7 +104,8 @@ async def call_llm(story, params):
     }
     async with aiohttp.ClientSession() as s:
         async with s.post(base_url + "/chat/completions", json=payload, headers=headers,
-                          timeout=aiohttp.ClientTimeout(total=120)) as r:
+                          timeout=aiohttp.ClientTimeout(
+                              total=storyplan.llm_timeout(cfg))) as r:
             if r.status != 200:
                 text = (await r.text())[:200]
                 raise RuntimeError(f"LLM HTTP {r.status}: {text}")
@@ -163,8 +164,10 @@ async def plan(graph, params, keyframe_graph, client_id):
             })
             llm_meta = {"used": True, "model": model, "error": ""}
         except Exception as e:
-            llm_meta = {"used": False, "model": "", "error": str(e)}
-            events.toast("warn", f"Сценарист: LLM недоступен ({e}) — "
+            cfg = REGISTRY.settings().get("llm") or {}
+            reason = storyplan.llm_error_text(e, storyplan.llm_timeout(cfg))
+            llm_meta = {"used": False, "model": "", "error": reason}
+            events.toast("warn", f"Сценарист: LLM недоступен ({reason}) — "
                                  "разбиваю эвристикой, промпты правьте в ноде")
     if plan_data is None:
         plan_data = storyplan.heuristic_split(story_text,

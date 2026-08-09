@@ -48,8 +48,12 @@ def spawn(port, env_extra, user_dir, log_name=None):
     log = open(os.path.join(os.path.dirname(__file__),
                             log_name or f"e2e_{port}.log"), "wb")
     return subprocess.Popen(
+        # --disable-auto-launch: иначе каждый тестовый инстанс открывает
+        # пользователю окно браузера, а инстанс под токеном отвечает туда
+        # «unauthorized» — три прогона тестов = шесть таких окон
         [PY, "-s", MAIN, "--windows-standalone-build", "--port", str(port),
-         "--listen", "127.0.0.1", "--cpu", "--user-directory", user_dir],
+         "--listen", "127.0.0.1", "--cpu", "--disable-auto-launch",
+         "--user-directory", user_dir],
         cwd=COMFY, env=env, stdout=log, stderr=subprocess.STDOUT,
     )
 

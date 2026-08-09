@@ -185,6 +185,25 @@ def test_mark_stale():
     assert storyplan.mark_stale_for_keyframe(m2, 0) == []   # draft-сегменты не трогаем
 
 
+def test_llm_timeout_falls_back_to_default():
+    default = float(storyplan.DEFAULT_SETTINGS["llm"]["timeout_s"])
+    assert storyplan.llm_timeout({"timeout_s": 42}) == 42
+    assert storyplan.llm_timeout({"timeout_s": 0}) == default
+    assert storyplan.llm_timeout({"timeout_s": "чепуха"}) == default
+    assert storyplan.llm_timeout({}) == default
+    assert storyplan.llm_timeout(None) == default
+
+
+def test_llm_error_text_names_the_timeout():
+    """aiohttp бросает TimeoutError без текста — раньше причина терялась
+    целиком, и план молча уходил в эвристику «без объяснений»."""
+    msg = storyplan.llm_error_text(TimeoutError(), 600)
+    assert "600" in msg and msg.strip()
+    assert storyplan.llm_error_text(RuntimeError("HTTP 404"), 600) == "HTTP 404"
+    # исключение без сообщения не должно давать пустую строку
+    assert storyplan.llm_error_text(ValueError(), 600) == "ValueError"
+
+
 def test_trim_manifest_view():
     m = {
         "label": "x",

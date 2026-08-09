@@ -50,6 +50,14 @@ def test_kaggle_despite_content_dir():
     assert _detect({"/kaggle", "/kaggle/working", "/kaggle/input", "/content"}) == "kaggle"
 
 
+def test_kaggle_batch_kernel_without_env_vars():
+    """Живой batch-кернел Kaggle (2026-08-09): переменных KAGGLE_* нет, а модуль
+    google.colab импортируется — Kaggle третий раз определился как Colab, увёл
+    каталоги в /content и остался без обхода лимита 20 ГБ."""
+    assert _detect({"/kaggle", "/kaggle/working", "/kaggle/input", "/content"},
+                   colab_module=True) == "kaggle"
+
+
 def test_env_wins_over_filesystem():
     assert _detect({"/kaggle", "/kaggle/working"}, {"COLAB_RELEASE_TAG": "1"}) == "colab"
     assert _detect({"/content", "/content/drive"},

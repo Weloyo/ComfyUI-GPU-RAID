@@ -16,6 +16,8 @@ import math
 import re
 import time
 
+from .consts import DEFAULT_SETTINGS
+
 SCHEMA = 2
 
 # тяжёлые поля, которые не ходят в WS-события и GET-ответы
@@ -154,6 +156,30 @@ def heuristic_split(story, target_segments=0, max_chars=350):
     segments = [{"prompt": c, "keyframe_prompt": c, "duration_s": None} for c in chunks]
     return {"style": "", "segments": segments,
             "final_keyframe_prompt": chunks[-1] if chunks else ""}
+
+
+def llm_timeout(cfg):
+    """Сколько ждём LLM. 0/мусор в настройках — дефолт, а не мгновенный отказ."""
+    try:
+        value = float((cfg or {}).get("timeout_s") or 0)
+    except (TypeError, ValueError):
+        value = 0
+    return value if value > 0 else float(DEFAULT_SETTINGS["llm"]["timeout_s"])
+
+
+def llm_error_text(e, timeout_s):
+    """Человеческая причина отказа LLM.
+
+    aiohttp бросает TimeoutError БЕЗ текста: `str(e)` — пустая строка, и в
+    манифесте оставалось «LLM не использован» без единого слова почему, а план
+    молча уезжал в эвристику (живьём: локальная 30B грузилась с диска дольше
+    таймаута).
+    """
+    if isinstance(e, TimeoutError):      # asyncio.TimeoutError с 3.11 — он же
+        return (f"LLM не ответил за {int(timeout_s)} с — локальная модель могла "
+                "грузиться с диска; повторите план или увеличьте "
+                "settings.llm.timeout_s")
+    return str(e).strip() or type(e).__name__
 
 
 def llm_messages(story, params):

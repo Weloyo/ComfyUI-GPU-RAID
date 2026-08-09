@@ -12,5 +12,7 @@ set "GPURAID_TOKEN=devtoken"
 set "GPURAID_AUTH_STRICT=1"
 
 echo Запускаю воркера на 127.0.0.1:8189 (токен: devtoken, строгий режим auth)...
-"%COMFY%\python_embeded\python.exe" -s "%COMFY%\ComfyUI\main.py" --windows-standalone-build --port 8189 --listen 127.0.0.1 %EXTRA_ARGS%
+rem --disable-auto-launch: воркеру браузер не нужен, а под токеном он открыл бы
+rem окно с ответом {"error": "unauthorized"}
+"%COMFY%\python_embeded\python.exe" -s "%COMFY%\ComfyUI\main.py" --windows-standalone-build --port 8189 --listen 127.0.0.1 --disable-auto-launch %EXTRA_ARGS%
 pause

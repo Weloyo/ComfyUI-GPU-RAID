@@ -70,6 +70,13 @@ def platform_detect():
     # и /content встречаются на обеих платформах (проверено живьём: сначала
     # Colab определялся как Kaggle по /kaggle, затем Kaggle как Colab по
     # /content), поэтому смотрим на то, чего у соседа быть не может.
+    #
+    # `/kaggle/working` идёт ПЕРЕД проверкой модуля google.colab: в batch-кернеле
+    # Kaggle (живьём 2026-08-09) переменных KAGGLE_* нет, а `google.colab`
+    # импортируется — и Kaggle третий раз подряд определился как Colab. У Colab
+    # каталог /kaggle пустой: рабочего подкаталога там не бывает.
+    if os.path.isdir("/kaggle/working"):
+        return "kaggle"
     try:
         import importlib.util
 
@@ -77,7 +84,7 @@ def platform_detect():
             return "colab"
     except Exception:
         pass
-    if os.path.isdir("/kaggle/working") or os.path.isdir("/kaggle/input"):
+    if os.path.isdir("/kaggle/input"):
         return "kaggle"
     if os.path.isdir("/content/drive") or os.path.isdir("/content/sample_data"):
         return "colab"
@@ -106,6 +113,13 @@ def publish_rendezvous(gh_token, gist_id, session, name, platform, string, state
     друга. Возвращает True/False, никогда не бросает.
     """
     if not gh_token or not gist_id:
+        # молчать здесь нельзя: воркер жив, но мастер о нём не узнает никогда, и
+        # в логе не будет ни слова почему (живьём: секреты кернела не прочитались,
+        # воркер час простоял «потерянным»)
+        missing = " и ".join(
+            n for n, v in (("GH_TOKEN", gh_token), ("GIST_ID", gist_id)) if not v)
+        print(f"[rendezvous] НЕ публикую адрес: нет {missing}. Мастер сам этого "
+              "воркера не найдёт — добавьте строку ниже в панель вручную.")
         return False
     payload = {
         "v": 1, "name": name, "platform": platform, "session": session,
@@ -358,7 +372,8 @@ def launch_comfy(comfy_dir, port, cuda_device, token, extra_args=(), log_path=No
         env["CUDA_VISIBLE_DEVICES"] = str(cuda_device)
     env.update(extra_env or {})
     cmd = [sys.executable, os.path.join(comfy_dir, "main.py"),
-           "--listen", "127.0.0.1", "--port", str(port), *extra_args]
+           "--listen", "127.0.0.1", "--port", str(port),
+           "--disable-auto-launch", *extra_args]
     log = open(log_path or f"/tmp/comfy_{port}.log", "ab")
     proc = subprocess.Popen(cmd, cwd=comfy_dir, env=env, stdout=log, stderr=subprocess.STDOUT)
     print(f"[comfy] pid {proc.pid} порт {port} gpu {cuda_device}")
