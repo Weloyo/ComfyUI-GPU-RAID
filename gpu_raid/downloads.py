@@ -21,6 +21,9 @@ log = logging.getLogger("gpu_raid")
 # логи — упереться в ноль на 39-м гигабайте из 40 обиднее, чем не начать
 FREE_SPACE_MARGIN = 1 << 30
 
+ATTEMPTS = 6            # обрыв многогигабайтной закачки — норма, а не исключение
+RETRY_PAUSE_S = 3       # пауза растёт линейно: 3, 6, 9…
+
 TASKS = {}  # task_id -> {state, bytes_done, bytes_total, filename, folder, error, started}
 
 
@@ -76,9 +79,45 @@ def _publish(dest, link_dir, filename):
             "уберите GPURAID_MODELS_DIR, чтобы качать прямо в models/") from e
 
 
+def _part_size(tmp):
+    try:
+        return os.path.getsize(tmp)
+    except OSError:
+        return 0
+
+
+async def _fetch_once(session, url, headers, tmp, task, dest_dir):
+    """Одна попытка: докачивает .part с того места, где оборвалось.
+
+    Возвращает True, если файл дошёл до конца.
+    """
+    have = _part_size(tmp)
+    hdrs = dict(headers)
+    if have:
+        hdrs["Range"] = f"bytes={have}-"
+    async with session.get(url, headers=hdrs, allow_redirects=True) as r:
+        if r.status == 416 and have:
+            return True                  # сервер говорит «дальше нечего» — всё уже есть
+        if r.status not in (200, 206):
+            raise RuntimeError(f"HTTP {r.status}")
+        if have and r.status == 200:
+            have = 0                     # Range проигнорирован — начинаем сначала
+        total = int(r.headers.get("Content-Length") or 0) + have
+        if total:
+            task["bytes_total"] = total
+        _check_space(dest_dir, max(0, total - have))
+        task["state"] = "downloading"
+        task["bytes_done"] = have
+        with open(tmp, "ab" if have else "wb") as f:
+            async for chunk in r.content.iter_chunked(1 << 20):
+                f.write(chunk)
+                task["bytes_done"] += len(chunk)
+    total = task.get("bytes_total") or 0
+    return not total or _part_size(tmp) >= total
+
+
 async def _run(task_id, folder, url, filename, hf_token, civitai_token):
     task = TASKS[task_id]
-    tmp = ""
     try:
         dest_dir, link_dir = _dirs(folder)
         headers = {}
@@ -91,32 +130,35 @@ async def _run(task_id, folder, url, filename, hf_token, civitai_token):
         dest = os.path.join(dest_dir, filename)
         tmp = dest + ".part"
         timeout = aiohttp.ClientTimeout(total=None, connect=30, sock_read=120)
+        # Многогигабайтная закачка по чужому каналу рвётся штатно: живьём HF
+        # оборвал 11 ГБ на 25% («Response payload is not completed»). Без
+        # докачки это означало бы начинать заново — и так до бесконечности.
         async with aiohttp.ClientSession(timeout=timeout) as session:
-            async with session.get(url, headers=headers, allow_redirects=True) as r:
-                if r.status != 200:
-                    raise RuntimeError(f"HTTP {r.status}")
-                task["bytes_total"] = int(r.headers.get("Content-Length") or 0)
-                _check_space(dest_dir, task["bytes_total"])
-                task["state"] = "downloading"
-                with open(tmp, "wb") as f:
-                    async for chunk in r.content.iter_chunked(1 << 20):
-                        f.write(chunk)
-                        task["bytes_done"] += len(chunk)
+            for attempt in range(1, ATTEMPTS + 1):
+                try:
+                    if await _fetch_once(session, url, headers, tmp, task, dest_dir):
+                        break
+                    reason = "файл пришёл не целиком"
+                except (aiohttp.ClientError, TimeoutError, OSError) as e:
+                    if isinstance(e, OSError) and not isinstance(e, aiohttp.ClientError):
+                        raise           # диск/права — повторять бессмысленно
+                    reason = f"{type(e).__name__}: {e}"
+                if attempt == ATTEMPTS:
+                    raise RuntimeError(
+                        f"{reason} (попыток: {ATTEMPTS}, скачано "
+                        f"{_part_size(tmp) / 2**30:.1f} ГБ — повтор продолжит с этого места)")
+                task["error"] = f"обрыв на попытке {attempt}/{ATTEMPTS}: {reason}"
+                log.warning("GPU RAID: %s — %s, докачиваю", filename, reason)
+                await asyncio.sleep(RETRY_PAUSE_S * attempt)
         os.replace(tmp, dest)
         _publish(dest, link_dir, filename)
+        task["error"] = ""
         task["state"] = "done"
         log.info("GPU RAID: скачано %s -> %s", filename, dest_dir)
     except Exception as e:
         task["state"] = "error"
         task["error"] = f"{type(e).__name__}: {e}"
         log.warning("GPU RAID: download %s failed: %s", filename, e)
-        # недокачанный .part на диске воркера — это те же гигабайты, из-за
-        # которых упала следующая попытка
-        try:
-            if tmp and os.path.exists(tmp):
-                os.remove(tmp)
-        except Exception:
-            pass
 
 
 def start(loop, folder, url, filename=None, hf_token=None, civitai_token=None):

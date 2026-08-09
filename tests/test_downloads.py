@@ -113,3 +113,16 @@ def test_publish_reports_broken_symlink():
 
 def test_publish_noop_without_link_dir():
     downloads._publish("/comfy/models/vae/ae.safetensors", None, "ae.safetensors")
+
+
+def test_part_size_of_missing_file_is_zero():
+    """С этого числа начинается Range-докачка: у несуществующего .part — ноль,
+    иначе первая же попытка запросила бы у сервера мусорный диапазон."""
+    assert downloads._part_size("/нет/такого/файла.part") == 0
+
+
+def test_retry_budget_is_meaningful():
+    """Живьём HF оборвал 11 ГБ дважды подряд (на 25% и 62%). Одна попытка —
+    это лотерея, поэтому их несколько с растущей паузой."""
+    assert downloads.ATTEMPTS >= 3
+    assert downloads.RETRY_PAUSE_S > 0

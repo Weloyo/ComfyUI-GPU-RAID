@@ -79,6 +79,27 @@ def secret(name):
         return ""
 
 
+def _gpus():
+    """Сколько инстансов поднимать: по одному на видеокарту.
+
+    Kaggle с ускорителем NvidiaTeslaT4 даёт ДВЕ карты — это два воркера в
+    RAID с одной сессии. Исключение — H3: 40 ГБ весов при ~29 ГБ RAM сессии
+    два инстанса не тянут (живьём убивало сессию по OOM, «status 42»).
+    """
+    if MODEL_PRESET == "minimax_h3":
+        return (0,)
+    try:
+        import torch
+
+        count = int(torch.cuda.device_count())
+    except Exception as e:
+        print(f"[gpu] не смог посчитать карты ({type(e).__name__}) — беру одну")
+        count = 1
+    count = max(1, count)
+    print(f"[gpu] карт видно: {count}")
+    return tuple(range(count))
+
+
 if not os.path.isdir(SRC):
     subprocess.check_call(["git", "clone", "--depth", "1", REPO_URL, SRC])
 sys.path.insert(0, os.path.join(SRC, "scripts"))
@@ -89,7 +110,7 @@ info = wb.bring_up(
     gpuraid_src=SRC,
     comfy_dir=os.path.join(WORK, "ComfyUI"),
     token=token,
-    gpus=(0,),
+    gpus=_gpus(),
     base_port=8188,
     extra_args=("--force-fp16",),   # у T4 нет bf16; RAM-guard для H3 добавится сам
     use_datasets=True,
