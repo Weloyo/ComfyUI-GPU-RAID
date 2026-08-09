@@ -96,6 +96,30 @@ export class ConnectionsUI {
             body.appendChild(ol);
         }
 
+        // готовый кусок конфига (например, для ячейки ноутбука) — чтобы не
+        // выискивать gist_id по переписке при каждом новом рантайме
+        const snippet = (p.values || {}).snippet;
+        if (snippet) {
+            const pre = el("pre", { class: "gr-snippet" }, esc(snippet));
+            const copy = el("button", { class: "gr-btn gr-small" }, "Копировать");
+            copy.onclick = async () => {
+                try {
+                    await navigator.clipboard.writeText(snippet);
+                    copy.textContent = "скопировано ✓";
+                    setTimeout(() => { copy.textContent = "Копировать"; }, 2000);
+                } catch (e) {
+                    // без https буфер обмена недоступен — выделяем, чтобы скопировали руками
+                    const r = document.createRange();
+                    r.selectNodeContents(pre);
+                    const sel = window.getSelection();
+                    sel.removeAllRanges();
+                    sel.addRange(r);
+                    toast("info", "Скопируйте выделенное", "Ctrl+C");
+                }
+            };
+            body.append(pre, copy);
+        }
+
         const inputs = {};
         for (const f of p.fields || []) {
             const value = (p.values || {})[f.key] || "";

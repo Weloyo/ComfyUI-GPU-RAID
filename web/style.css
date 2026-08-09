@@ -99,6 +99,9 @@
     border-top: 1px dashed var(--border-color, #444); margin-top: 5px; }
 .gr-conn a.gr-btn { text-decoration: none; }
 .gr-steps { margin: 2px 0 2px 18px; padding: 0; opacity: 0.8; line-height: 1.4; }
+.gr-snippet { margin: 2px 0; padding: 6px 8px; border-radius: 4px; font-size: 11px;
+    background: var(--comfy-input-bg, #2a2a2a); border: 1px solid var(--border-color, #555);
+    white-space: pre; overflow-x: auto; user-select: all; }
 
 /* библиотека моделей и матрица «модель × воркер» */
 .gr-modellist { display: flex; flex-direction: column; gap: 2px; margin-top: 4px; }

@@ -146,8 +146,13 @@ PROVIDERS = (
         ],
         "steps": [
             "Настройте GitHub выше — воркер подключится сам.",
-            "В ноутбуке: 🔑 Secrets → добавьте GH_TOKEN (тот же токен) и "
-            "включите доступ для ноутбука.",
+            "Откройте ноутбук и сразу сделайте File → «Save a copy in Drive». "
+            "Иначе каждый новый рантайм клонирует ноутбук из GitHub заново и "
+            "правки конфига теряются — их придётся вбивать каждый раз.",
+            "В своей копии замените две строки в ячейке «КОНФИГ» — готовый "
+            "текст ниже, кнопка «копировать».",
+            "В ноутбуке: 🔑 Secrets → добавьте GH_TOKEN (тот же токен, что "
+            "выше) и включите доступ для этого ноутбука.",
             "Runtime → Run all. Воркер появится в списке за ~30 секунд.",
         ],
     },
@@ -293,10 +298,15 @@ def status_view(settings, secrets_view):
     checks = settings.get("connections") or {}
     llm = settings.get("llm") or {}
     rdv = settings.get("rendezvous") or {}
+    gist_id = rdv.get("gist_id", "")
     values = {
         "llm": {"base_url": llm.get("base_url", ""), "model": llm.get("model", "")},
-        "github": {"gist_id": rdv.get("gist_id", "")},
+        "github": {"gist_id": gist_id},
         "kaggle": {"username": kaggle_username(settings)},
+        # готовый кусок конфига для ноутбука: gist_id иначе приходится искать
+        # по переписке при каждом новом рантайме
+        "colab": {"snippet": ('I_USE_PAID_COLAB = True\nGIST_ID = "%s"' % gist_id)
+                  if gist_id else ""},
     }
     out = []
     for p in PROVIDERS:
