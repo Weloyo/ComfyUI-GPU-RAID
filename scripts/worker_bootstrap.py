@@ -62,12 +62,25 @@ def platform_detect():
     """
     if "COLAB_RELEASE_TAG" in os.environ or "COLAB_GPU" in os.environ:
         return "colab"
-    if os.environ.get("KAGGLE_KERNEL_RUN_TYPE") or os.environ.get("KAGGLE_URL_BASE"):
+    for var in ("KAGGLE_KERNEL_RUN_TYPE", "KAGGLE_URL_BASE", "KAGGLE_DATA_PROXY_TOKEN",
+                "KAGGLE_CONTAINER_NAME"):
+        if os.environ.get(var):
+            return "kaggle"
+    # признаки по файловой системе — только ВЗАИМОИСКЛЮЧАЮЩИЕ. Каталоги /kaggle
+    # и /content встречаются на обеих платформах (проверено живьём: сначала
+    # Colab определялся как Kaggle по /kaggle, затем Kaggle как Colab по
+    # /content), поэтому смотрим на то, чего у соседа быть не может.
+    try:
+        import importlib.util
+
+        if importlib.util.find_spec("google.colab") is not None:
+            return "colab"
+    except Exception:
+        pass
+    if os.path.isdir("/kaggle/working") or os.path.isdir("/kaggle/input"):
         return "kaggle"
-    if os.path.isdir("/content"):
+    if os.path.isdir("/content/drive") or os.path.isdir("/content/sample_data"):
         return "colab"
-    if os.path.isdir("/kaggle"):
-        return "kaggle"
     return "generic"
 
 

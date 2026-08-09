@@ -16,6 +16,7 @@ import json
 import os
 import shutil
 import tempfile
+import time
 
 from . import config
 from . import secrets as secret_store
@@ -120,9 +121,31 @@ async def ensure_secret_dataset():
                                     timeout=180)
             if code != 0:
                 raise RuntimeError(f"kaggle datasets version: {text[:400]}")
+        await _wait_dataset_ready(slug)
     finally:
         shutil.rmtree(d, ignore_errors=True)
     return slug
+
+
+async def _wait_dataset_ready(slug, timeout_s=180):
+    """Ждём, пока Kaggle обработает версию датасета.
+
+    Обработка асинхронная: если запушить кернел сразу, датасет к его старту ещё
+    не смонтируется, и кернел не увидит секретов (живьём: FileNotFoundError на
+    /kaggle/input/... и воркер не смог опубликовать адрес в гисте).
+    """
+    deadline = time.monotonic() + timeout_s
+    last = ""
+    while time.monotonic() < deadline:
+        code, text = await _run("datasets", "status", slug, timeout=60)
+        last = (text or "").strip()
+        if code == 0 and "ready" in last.lower():
+            return True
+        if "error" in last.lower():
+            raise RuntimeError(f"датасет секретов не обработан: {last[:200]}")
+        await asyncio.sleep(5)
+    raise RuntimeError(
+        f"датасет секретов не готов за {timeout_s}с (последний статус: {last[:120]})")
 
 
 def build_kernel_dir(params):
