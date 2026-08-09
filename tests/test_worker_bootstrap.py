@@ -58,8 +58,17 @@ def test_kaggle_batch_kernel_without_env_vars():
                    colab_module=True) == "kaggle"
 
 
+def test_kaggle_working_dir_beats_colab_env():
+    """Живьём (2026-08-09): в кернеле Kaggle есть COLAB_*-переменные, и они
+    перебивали всё остальное. Рабочий каталог Kaggle надёжнее любой env."""
+    assert _detect({"/kaggle", "/kaggle/working"}, {"COLAB_RELEASE_TAG": "1"}) == "kaggle"
+    assert _detect({"/kaggle", "/kaggle/working"}, {"COLAB_GPU": "1"},
+                   colab_module=True) == "kaggle"
+
+
 def test_env_wins_over_filesystem():
-    assert _detect({"/kaggle", "/kaggle/working"}, {"COLAB_RELEASE_TAG": "1"}) == "colab"
+    # без рабочего каталога Kaggle переменные по-прежнему главнее каталогов
+    assert _detect({"/kaggle"}, {"COLAB_RELEASE_TAG": "1"}) == "colab"
     assert _detect({"/content", "/content/drive"},
                    {"KAGGLE_KERNEL_RUN_TYPE": "Batch"}) == "kaggle"
 

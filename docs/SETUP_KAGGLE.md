@@ -79,6 +79,18 @@
 поднимите `settings.timeouts.video_startup_s` в `workers.json` (например, до
 1200с).
 
+## Какой GPU просить
+
+По API Kaggle по умолчанию выдаёт **P100**, а это Pascal (sm_60) — свежие
+сборки PyTorch, который ставится вместе с ComfyUI, ядер для Pascal больше не
+содержат. Воркер при этом поднимается, качает модели и падает на первой же
+операции: `CUDA error: no kernel image is available for execution on the
+device` (проверено живьём 2026-08-09).
+
+Поэтому мастер просит ускоритель явно: `--accelerator NvidiaTeslaT4`
+(`kaggle_api.DEFAULT_ACCELERATOR`). Другое значение можно передать в теле
+запроса `POST /gpuraid/kaggle/start` полем `accelerator`.
+
 ## Особенности T4
 
 - T4 **не поддерживает bf16** — ноутбук запускает ComfyUI с `--force-fp16`.

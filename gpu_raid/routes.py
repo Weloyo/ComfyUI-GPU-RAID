@@ -404,6 +404,7 @@ async def kaggle_start(request):
         "model_preset": data.get("model_preset") or "none",
         "max_session_min": (settings.get("lifecycle") or {}).get("budget_min") or 0,
         "name_prefix": data.get("name_prefix") or "kaggle",
+        "accelerator": data.get("accelerator") or kaggle_api.DEFAULT_ACCELERATOR,
     }
     try:
         result = await kaggle_api.push(params)
@@ -412,7 +413,8 @@ async def kaggle_start(request):
     except Exception as e:
         log.exception("kaggle push failed")
         return _err(500, e)
-    events.toast("info", f"Kaggle-кернел «{result['kernel']}» запущен — воркер "
+    events.toast("info", f"Kaggle-кернел «{result['kernel']}» запущен "
+                         f"({result.get('accelerator', '')}) — воркер "
                          "зарегистрируется сам через несколько минут")
     return web.json_response(result)
 

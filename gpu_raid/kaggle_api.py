@@ -30,6 +30,13 @@ KERNEL_TITLE = "gpu-raid-worker"
 SECRET_DATASET_TITLE = "gpu-raid-secrets"
 SECRET_FILE = "gpuraid_secrets.json"
 
+# Просить ускоритель ЯВНО. По API Kaggle по умолчанию выдаёт NvidiaTeslaP100, а
+# Pascal (sm_60) выпал из свежих сборок PyTorch, который ставится вместе с
+# ComfyUI: воркер поднимается, качает модели и падает на первой же операции
+# «CUDA error: no kernel image is available for execution on the device»
+# (проверено живьём 2026-08-09). T4 — sm_75, поддерживается, и их дают две.
+DEFAULT_ACCELERATOR = "NvidiaTeslaT4"
+
 
 def _cli():
     from . import providers
@@ -201,14 +208,16 @@ async def push(params):
     """
     params = dict(params)
     params["secret_dataset"] = await ensure_secret_dataset()
+    accelerator = str(params.get("accelerator") or DEFAULT_ACCELERATOR).strip()
     kdir = build_kernel_dir(params)
     try:
-        code, text = await _run("kernels", "push", "-p", kdir, timeout=180)
+        code, text = await _run("kernels", "push", "-p", kdir,
+                                "--accelerator", accelerator, timeout=180)
     finally:
         shutil.rmtree(kdir, ignore_errors=True)
     if code != 0:
         raise RuntimeError(f"kaggle push: {text[:500]}")
-    return {"kernel": kernel_slug(), "log": text[:500],
+    return {"kernel": kernel_slug(), "log": text[:500], "accelerator": accelerator,
             "secret_dataset": params.get("secret_dataset", "")}
 
 

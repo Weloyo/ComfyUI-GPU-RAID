@@ -83,12 +83,15 @@ def detection_evidence():
 def platform_detect():
     """Где мы работаем: colab | kaggle | generic.
 
-    Порядок важен. Сначала переменные окружения — они однозначны. Каталог
-    /kaggle есть и в образе Colab, поэтому проверка по файловой системе, если
-    до неё дошло, тоже начинается с Colab: ошибка здесь стоила бы автостопа
-    (platform_shutdown зовёт runtime.unassign только для colab, и рантайм
-    Colab продолжал бы жечь квоту после остановки воркера).
+    Порядок важен, и он выстрадан: переменные окружения НЕ однозначны. В живом
+    batch-кернеле Kaggle переменных `KAGGLE_*` нет, зато есть `COLAB_*` и
+    импортируется `google.colab` — на них детектор ошибался трижды. Самый
+    надёжный признак — рабочий каталог Kaggle: у Colab каталог /kaggle если и
+    есть, то пустой. Цена ошибки: автостоп зовёт runtime.unassign только для
+    colab, и рантайм продолжал бы жечь квоту после остановки воркера.
     """
+    if on_kaggle():
+        return "kaggle"
     if "COLAB_RELEASE_TAG" in os.environ or "COLAB_GPU" in os.environ:
         return "colab"
     for var in ("KAGGLE_KERNEL_RUN_TYPE", "KAGGLE_URL_BASE", "KAGGLE_DATA_PROXY_TOKEN",
