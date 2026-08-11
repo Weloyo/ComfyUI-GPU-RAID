@@ -112,3 +112,39 @@ def test_is_cloud_allowed():
     assert rules.is_cloud_allowed("eco")
     assert rules.is_cloud_allowed("keep")
     assert not rules.is_cloud_allowed("local_only")
+
+
+def test_effective_policy_layers():
+    cfg = {"policy": "eco", "idle_stop_min": 10, "budget_min": 30,
+           "platform_overrides": {"colab": {"policy": "keep"},
+                                  "kaggle": {"policy": "instant",
+                                             "idle_stop_min": 3}}}
+    # без переопределений — глобальная
+    out = rules.effective_policy(cfg, "runpod", None)
+    assert out["policy"] == "eco" and out["idle_stop_min"] == 10
+    # платформа перекрывает глобальную
+    assert rules.effective_policy(cfg, "colab", None)["policy"] == "keep"
+    out = rules.effective_policy(cfg, "kaggle", None)
+    assert out["policy"] == "instant" and out["idle_stop_min"] == 3
+    # запись воркера перекрывает платформу
+    out = rules.effective_policy(cfg, "colab", {"policy": "eco", "idle_stop_min": 5})
+    assert out["policy"] == "eco" and out["idle_stop_min"] == 5
+    # inherit/пусто ничего не меняет
+    out = rules.effective_policy(cfg, "colab", {"policy": "inherit"})
+    assert out["policy"] == "keep"
+    # budget_min всегда глобальный
+    assert out["budget_min"] == 30
+    # мусорный idle_stop_min не роняет и не перекрывает
+    out = rules.effective_policy(cfg, "kaggle", {"idle_stop_min": "ерунда"})
+    assert out["idle_stop_min"] == 3
+
+
+def test_effective_policy_feeds_decide():
+    cfg = {"policy": "keep", "idle_stop_min": 10,
+           "platform_overrides": {"kaggle": {"policy": "instant"}}}
+    eff = rules.effective_policy(cfg, "kaggle", None)
+    d, _ = rules.decide(eff, _view(idle_s=60, has_worked=True), NOW)
+    assert d == rules.STOP
+    eff = rules.effective_policy(cfg, "colab", None)
+    d, _ = rules.decide(eff, _view(idle_s=6000, has_worked=True), NOW)
+    assert d == rules.NONE

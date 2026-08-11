@@ -396,14 +396,22 @@ async def rerender_segment(label, index, seed=None, prompt=None):
 
     new_seed = int(seed) if seed is not None else int.from_bytes(os.urandom(6), "big")
     new_prompt = str(prompt) if prompt is not None else seg.get("prompt")
+    render_prompt = new_prompt
+    if manifest.get("mode") == "story":
+        # тот же формат (style_bible + опционально MiniMax [Shot 1]), что и
+        # массовый рендер сегментов (story.render_segments) — иначе поштучное
+        # «заново» тут давало бы другой фактический промпт для того же
+        # сегмента, чем кнопка «Сегменты ▶»
+        render_prompt = storyplan.render_prompt_for_segment(
+            manifest, new_prompt, seg.get("duration_s"))
     unit, ugraph = _make_unit(job, spec, index, seg.get("start_image"),
-                              seg.get("end_image"), new_prompt, new_seed)
+                              seg.get("end_image"), render_prompt, new_seed)
     job.units.append(unit)
     job.unit_graphs = {index: ugraph}
     job.unit_uploads[index] = _uploads_for_graph(ugraph, job.job_id)
     job.build_graph = lambda u: job.unit_graphs[u.index]
     seg["status"] = "rendering"
-    seg["prompt"] = new_prompt      # новый промпт персистится до рендера:
+    seg["prompt"] = new_prompt      # сырой промпт персистится до рендера:
     seg.pop("dirty", None)          # переживает рестарт и снимает флаг dirty
     save_manifest(manifest)
     MANAGER._register(job)

@@ -1,4 +1,4 @@
-// UI внутри нод GPU RAID: раскадровка Сценариста, Длинное видео, Offload, Конвейер.
+// UI внутри нод GPU RAID: История/Раскадровка/Видеоряд, Длинное видео, Offload, Конвейер.
 // Вся работа с промптами, кадрами и запуском живёт в рабочей области; в панели
 // расширения остаются только воркеры, настройки и мониторинг.
 import { app } from "../../../scripts/app.js";
@@ -6,12 +6,16 @@ import { gr, toast, clientId } from "./api.js";
 import { el, esc, fmtGb } from "./format.js";
 import { ProjectEditor } from "./editor.js";
 import { ModelsNodeUI } from "./models.js";
+import { WorkersNodeUI } from "./workersui.js";
 
-export const NODE_STORY = "GPURAID_StoryDirector";
+export const NODE_STORY = "GPURAID_Story";
+export const NODE_STORYBOARD = "GPURAID_Storyboard";
+export const NODE_VIDEOSEQ = "GPURAID_VideoSequence";
 export const NODE_LV = "GPURAID_LongVideo";
 export const NODE_OFFLOAD = "GPURAID_Offload";
 export const NODE_PIPELINE = "GPURAID_Pipeline";
 export const NODE_MODELS = "GPURAID_Models";
+export const NODE_WORKERS = "GPURAID_Workers";
 
 // ---------------------------------------------------------------- утилиты
 
@@ -26,6 +30,24 @@ function wval(node, name, fallback) {
 
 function lines(text) {
     return String(text || "").split("\n").map((s) => s.trim()).filter(Boolean);
+}
+
+/** Нативный виджет настройки (continuity_mode/prompt_format/preview_*) сам по
+ *  себе ни во что не пишется — рендер читает манифест с сервера. Без этого
+ *  изменение виджета на канве молча ничего не значит. */
+function wireSettingWidget(node, widgetName, endpoint) {
+    const w = widget(node, widgetName);
+    if (!w) return;
+    const orig = w.callback;
+    w.callback = function (value, ...rest) {
+        const r = orig ? orig.apply(this, [value, ...rest]) : undefined;
+        const label = node.properties?.gpuraid_project;
+        if (label) {
+            gr.patch(`/story/${encodeURIComponent(label)}/${endpoint}`, { [widgetName]: value })
+                .catch((e) => toast("error", "Настройка не сохранена", e.message));
+        }
+        return r;
+    };
 }
 
 /** Ноды типа type, которые реально уедут в prompt (без mute/bypass). */
@@ -60,10 +82,76 @@ function viewCenter() {
     return [80, 80];
 }
 
+/** Добавить (или найти) ноду типа type на канве и показать её. */
+export function revealNodeOnCanvas(type) {
+    let node = findNodes(type)[0];
+    if (!node) {
+        const LG = window.LiteGraph;
+        if (!LG) { toast("error", "GPU RAID", "LiteGraph недоступен"); return null; }
+        node = LG.createNode(type);
+        if (!node) { toast("error", "GPU RAID", `нода ${type} не зарегистрирована`); return null; }
+        app.graph.add(node);
+        node.pos = viewCenter();
+    }
+    try { app.canvas.centerOnNode(node); app.canvas.setDirty(true, true); } catch (e) { /* ignore */ }
+    return node;
+}
+
 function prop(node, key, fallback = "") {
     if (!node.properties) node.properties = {};
     if (node.properties[key] === undefined) node.properties[key] = fallback;
     return node.properties[key];
+}
+
+/**
+ * Апстрим-нода, подключённая ко входу "project" (коннектор GPURAID_PROJECT),
+ * и её привязанный проект — если есть. `getInputNode` — штатный LiteGraph-
+ * метод; на случай расхождений в версии фронтенда — тот же сырой обход
+ * через graph.links/getNodeById, что уже использует openProjectOnCanvas.
+ */
+function upstreamProjectLabel(node) {
+    try {
+        const slot = (node.inputs || []).findIndex((i) => i.name === "project");
+        if (slot < 0) return null;
+        let up = typeof node.getInputNode === "function" ? node.getInputNode(slot) : null;
+        if (!up) {
+            const linkId = node.inputs[slot]?.link;
+            const linkInfo = linkId != null ? app.graph.links[linkId] : null;
+            if (linkInfo) up = app.graph.getNodeById(linkInfo.origin_id);
+        }
+        return up?.properties?.gpuraid_project || null;
+    } catch (e) {
+        return null;
+    }
+}
+
+/** Ноды, подключённые к выходу "project" этой ноды (симметрично
+ *  upstreamProjectLabel) — чтобы протолкнуть свежую привязку вниз по цепочке. */
+function downstreamProjectNodes(node) {
+    const slot = (node.outputs || []).findIndex((o) => o.name === "project");
+    if (slot < 0) return [];
+    const out = [];
+    for (const id of node.outputs[slot]?.links || []) {
+        const li = app.graph.links[id];
+        const n = li ? app.graph.getNodeById(li.target_id) : null;
+        if (n) out.push(n);
+    }
+    return out;
+}
+
+/** Подхватить привязку из коннектора, если она есть и отличается от текущей
+ *  (тот же confirm(), что при ручном переключении дропдауном). Отключение
+ *  связи привязку НЕ сбрасывает — дропдаун остаётся рабочим фоллбэком. */
+function autoBindFromConnector(ui) {
+    const label = upstreamProjectLabel(ui.node);
+    if (!label) return;
+    const cur = ui.node.properties.gpuraid_project || "";
+    if (label === cur) return;
+    if (cur && !confirm(
+        `Нода привязана к проекту «${cur}». Переключить на «${label}» (по коннектору)?`)) {
+        return;
+    }
+    ui.bind(label);
 }
 
 // ---------------------------------------------------------------- проекты
@@ -76,20 +164,25 @@ class ProjectNodeUI {
         const box = nodeBody(node, cfg.size);
 
         const bar = el("div", { class: "gr-btns gr-node-bar" });
-        this.runBtn = el("button", { class: "gr-btn gr-primary", title: cfg.runTitle },
-            cfg.runLabel);
-        this.runBtn.onclick = () => this.run();
+        // Раскадровка/Видеоряд не имеют отдельного "создать" действия — только
+        // кнопки рендера внутри редактора; runBtn им не нужен
+        if (cfg.onRun) {
+            this.runBtn = el("button", { class: "gr-btn gr-primary", title: cfg.runTitle },
+                cfg.runLabel);
+            this.runBtn.onclick = () => this.run();
+            bar.appendChild(this.runBtn);
+        }
         this.sel = el("select", { class: "gr-select gr-proj-sel",
             title: "проект, привязанный к этой ноде" });
         this.sel.onmousedown = () => this.refreshProjects();
         this.sel.onchange = () => this.bind(this.sel.value);
-        bar.append(this.runBtn, el("span", { class: "gr-muted" }, "проект:"), this.sel);
+        bar.append(el("span", { class: "gr-muted" }, "проект:"), this.sel);
         box.appendChild(bar);
         if (cfg.hint) box.appendChild(el("div", { class: "gr-muted gr-node-hint" }, cfg.hint));
 
         const edRoot = el("div", { class: "gr-node-editor" });
         box.appendChild(edRoot);
-        this.editor = new ProjectEditor(edRoot);
+        this.editor = new ProjectEditor(edRoot, cfg.stage);
 
         prop(node, "gpuraid_project", "");
         this.refreshProjects();
@@ -118,10 +211,16 @@ class ProjectNodeUI {
         this.node.properties.gpuraid_project = label || "";
         this.sel.value = label || "";
         this.editor.setProject(label || "", true);
+        // привязка появилась/сменилась здесь — толкнуть вниз по GPURAID_PROJECT
+        // коннектору: сама эта нода могла быть подключена ДО того, как у неё
+        // появился label (типичный случай — «План ▶» на уже свёрстанном примере)
+        for (const n of downstreamProjectNodes(this.node)) n.__gr?.sync?.();
     }
 
-    /** Перечитать привязку из свойств ноды (после загрузки workflow). */
+    /** Перечитать привязку из свойств ноды (после загрузки workflow) — сперва
+     *  пробуя коннектор, иначе то, что уже сохранено в properties. */
     sync() {
+        autoBindFromConnector(this);
         this.editor.setProject(this.node.properties.gpuraid_project || "", true);
         this.sel.value = this.node.properties.gpuraid_project || "";
     }
@@ -129,6 +228,16 @@ class ProjectNodeUI {
     onConfigure() {
         this.refreshProjects();
         setTimeout(() => this.sync(), 0);
+    }
+
+    /** LiteGraph-колбэк ноды (патчится ниже, в beforeRegisterNodeDef): вход
+     *  "project" только что подключили — подхватить привязку сразу, не ждать
+     *  следующего onConfigure. */
+    onConnectionsChange(type, index) {
+        const INPUT = window.LiteGraph?.INPUT;
+        if (INPUT !== undefined && type !== INPUT) return;
+        if (this.node.inputs?.[index]?.name !== "project") return;
+        autoBindFromConnector(this);
     }
 
     async run() {
@@ -146,12 +255,32 @@ class ProjectNodeUI {
     dispose() { this.editor.dispose(); }
 }
 
-/** «План»: LLM (или эвристика) разбирает сюжет из виджетов ноды на сегменты. */
+/** «План»: LLM (или эвристика) разбирает сюжет из виджетов ноды на сегменты
+ *  с таймингом. Графа канвы не требует — шаблоны захватываются отдельно, уже
+ *  над готовым проектом, нодами Раскадровка/Видеоряд. */
 export async function runStoryPlan(node) {
-    const p = await app.graphToPrompt();
-    const r = await gr.post("/story/plan", { graph: p.output, client_id: clientId() });
+    const params = {
+        story: wval(node, "story", ""),
+        label: wval(node, "label", "story"),
+        segments_count: parseInt(wval(node, "segments_count", 0), 10) || 0,
+        segment_duration_s: parseFloat(wval(node, "segment_duration_s", 5.0)) || 5.0,
+        max_segment_duration_s: parseFloat(wval(node, "max_segment_duration_s", 0)) || null,
+        max_total_duration_s: parseFloat(wval(node, "max_total_duration_s", 0)) || null,
+        fps: parseInt(wval(node, "fps", 24), 10) || 24,
+        aspect: wval(node, "aspect", "16:9"),
+        short_edge: parseInt(wval(node, "short_edge", 768), 10) || 768,
+        snap: wval(node, "snap", "minimax_h3"),
+        use_llm: !!wval(node, "use_llm", true),
+        model: wval(node, "model", ""),
+        system_prompt: wval(node, "system_prompt", ""),
+        temperature: parseFloat(wval(node, "temperature", 0.7)),
+        max_tokens: parseInt(wval(node, "max_tokens", 0), 10) || 0,
+        seed: parseInt(wval(node, "seed", 0), 10) || 0,
+    };
+    const r = await gr.post("/story/plan", { params, client_id: clientId() });
     toast("success", `План «${r.label}» готов`,
-        "правьте промпты кадров и сегментов, затем «Кадры ▶»");
+        "подключите Раскадровку и Видеоряд (коннектором или дропдауном «проект:»), "
+        + "захватите шаблоны, затем «Кадры ▶»");
     return r.label;
 }
 
@@ -179,7 +308,10 @@ export async function runLongVideo(node) {
  * Вызывается из панели («Открыть на канве»).
  */
 export function openProjectOnCanvas(label, mode) {
-    const type = mode === "story" ? NODE_STORY : NODE_LV;
+    // История/Раскадровка/Видеоряд — три ноды одного проекта; открываем на
+    // Видеоряде (он показывает сегменты — обычно то, ради чего открывают
+    // проект повторно). Остальные две можно добавить и привязать вручную.
+    const type = mode === "story" ? NODE_VIDEOSEQ : NODE_LV;
     const nodes = findNodes(type);
     let node = nodes.find((n) => n.properties?.gpuraid_project === label);
     if (!node && nodes.length === 1) {
@@ -245,7 +377,7 @@ class OffloadNodeUI {
         this.sel.innerHTML = "";
         if (!workers.length) {
             this.sel.appendChild(el("option", { value: "" }, "нет включённых воркеров"));
-            this.status.textContent = "добавьте воркера в панели GPU RAID";
+            this.status.textContent = "добавьте воркера в ноде «GPU RAID Воркеры»";
             return;
         }
         for (const w of workers) {
@@ -274,7 +406,8 @@ class OffloadNodeUI {
                 label: wval(this.node, "label", "offload"), client_id: clientId(),
             });
             toast("info", "Offload запущен", (r.warnings || []).join("; "));
-            this.status.textContent = `задание ${r.job_id} — прогресс в панели «Задания»`;
+            this.status.textContent =
+                `задание ${r.job_id} — прогресс в ноде «Воркеры» и тостах`;
         } catch (e) {
             toast(e.status === 409 ? "warn" : "error", "Offload не запущен", e.message, 8000);
         } finally {
@@ -291,43 +424,37 @@ class OffloadNodeUI {
 class PipelineNodeUI {
     constructor(node) {
         this.node = node;
-        prop(node, "gpuraid_placement", {});
         const box = nodeBody(node, { width: 520, height: 380, minHeight: 200 });
         const bar = el("div", { class: "gr-btns gr-node-bar" });
         this.anaBtn = el("button", { class: "gr-btn",
-            title: "разрезать текущий workflow на стадии и предложить раскладку по воркерам" },
-            "Проанализировать");
+            title: "разрезать текущий workflow на стадии по привязкам лоадеров "
+                + "и показать раскладку" },
+            "Раскладка");
         this.anaBtn.onclick = () => this.analyze();
         this.runBtn = el("button", { class: "gr-btn gr-primary",
-            title: "запустить стадии по сохранённой раскладке" }, "Запустить конвейер ▶");
+            title: "запустить стадии по привязкам лоадеров (Queue делает то же)" },
+            "Запустить конвейер ▶");
         this.runBtn.onclick = () => this.run();
         bar.append(this.anaBtn, this.runBtn);
         box.appendChild(bar);
         box.appendChild(el("div", { class: "gr-muted gr-node-hint" },
-            "Для моделей, которые не влезают целиком ни в один GPU: энкодер / диффузия / "
-            + "VAE считают разные воркеры, промежуточные тензоры едут бандлами. "
-            + "Спец-ноды в графе не нужны."));
+            "Где какой модели считаться — задаётся в самих нодах-лоадерах "
+            + "(блок GPU RAID: локально / Colab / Kaggle / воркер). Здесь — "
+            + "раскладка стадий, предупреждения, запуск и прогресс. "
+            + "Промежуточные тензоры едут бандлами, спец-ноды в графе не нужны."));
         this.report = el("div", { class: "gr-node-report" });
         box.appendChild(this.report);
+        this.progress = el("div", { class: "gr-progress" });
+        box.appendChild(this.progress);
         this.renderReport();
     }
-
-    get placement() { return this.node.properties.gpuraid_placement || {}; }
 
     async analyze() {
         this.anaBtn.disabled = true;
         try {
             const p = await app.graphToPrompt();
-            this._graph = p.output;
-            this._workflow = p.workflow;
-            this._report = await gr.post("/pipeline/analyze", { graph: p.output });
-            const saved = this.placement;
-            const merged = { ...(this._report.placement || {}) };
-            // ручная раскладка пользователя важнее автоматической
-            for (const [k, v] of Object.entries(saved)) {
-                if ((this._report.workers || []).some((w) => w.id === v)) merged[k] = v;
-            }
-            this.node.properties.gpuraid_placement = merged;
+            this._report = await gr.post("/pipeline/analyze",
+                { graph: p.output, workflow_ui: p.workflow });
             this.renderReport();
         } catch (e) {
             toast(e.status === 409 ? "warn" : "error", "Анализ не удался", e.message, 8000);
@@ -341,35 +468,30 @@ class PipelineNodeUI {
         box.innerHTML = "";
         const r = this._report;
         if (!r) {
-            const n = Object.keys(this.placement).length;
-            box.appendChild(el("div", { class: "gr-muted" }, n
-                ? `раскладка сохранена (${n} стадий) — нажмите «Проанализировать», чтобы увидеть детали`
-                : "нажмите «Проанализировать» — граф будет разрезан на стадии"));
+            box.appendChild(el("div", { class: "gr-muted" },
+                "нажмите «Раскладка» — покажу, какая стадия на какой GPU поедет "
+                + "(по привязкам в нодах-лоадерах)"));
             return;
         }
         for (const w of r.warnings || []) {
             box.appendChild(el("div", { class: "gr-muted" }, `⚠ ${esc(w)}`));
         }
+        const workerName = (id) => {
+            const w = (r.workers || []).find((x) => x.id === id);
+            return w ? `${w.name} (${w.vram_gb} ГБ)` : (id || "—");
+        };
         for (const isl of r.islands || []) {
             const row = el("div", { class: "gr-job" });
             const models = Object.entries(isl.models || {})
                 .flatMap(([f, names]) => names.map((n) => `${f}/${n}`));
+            const via = isl.assign
+                ? ` <span class="gr-muted">· привязка «${esc(isl.assign_label)}»`
+                  + (isl.decided_by ? ` из ${esc(isl.decided_by)}` : "") + "</span>"
+                : ' <span class="gr-muted">· авто</span>';
             row.appendChild(el("div", {},
-                `<b>Стадия ${isl.id}</b> · ~${esc(String(isl.vram_est_gb))} ГБ VRAM`
-                + `<div class="gr-muted">${esc(isl.classes.join(", "))}</div>`
+                `<b>Стадия ${isl.id}</b> → ${esc(workerName(isl.worker_id))}${via}`
+                + `<div class="gr-muted">~${esc(String(isl.vram_est_gb))} ГБ VRAM · ${esc(isl.classes.join(", "))}</div>`
                 + (models.length ? `<div class="gr-muted">${esc(models.join(" · "))}</div>` : "")));
-            const sel = el("select", { class: "gr-select" });
-            for (const w of r.workers || []) {
-                const opt = el("option", { value: w.id }, esc(`${w.name} (${w.vram_gb} ГБ)`));
-                if (this.placement[isl.id] === w.id) opt.selected = true;
-                sel.appendChild(opt);
-            }
-            sel.onchange = () => {
-                this.node.properties.gpuraid_placement = {
-                    ...this.placement, [isl.id]: sel.value,
-                };
-            };
-            row.appendChild(sel);
             box.appendChild(row);
         }
         for (const c of r.cuts || []) {
@@ -382,19 +504,13 @@ class PipelineNodeUI {
     async run() {
         this.runBtn.disabled = true;
         try {
-            let graph = this._graph;
-            let workflow = this._workflow;
-            if (!graph) {
-                const p = await app.graphToPrompt();
-                graph = p.output;
-                workflow = p.workflow;
-            }
+            const p = await app.graphToPrompt();
             const resp = await gr.post("/pipeline/start", {
-                graph, workflow_ui: workflow, placement: this.placement,
+                graph: p.output, workflow_ui: p.workflow,
                 label: wval(this.node, "label", "pipeline"), client_id: clientId(),
             });
-            toast("success", `Конвейер запущен: ${resp.stages} стадий`,
-                "прогресс — в панели «Задания»");
+            toast("success", `Конвейер запущен: ${resp.stages} стадий`);
+            this.watch(resp.job_id);
         } catch (e) {
             toast(e.status === 409 ? "warn" : "error", "Конвейер не запущен", e.message, 8000);
         } finally {
@@ -402,8 +518,48 @@ class PipelineNodeUI {
         }
     }
 
+    /** Прогресс стадий прямо в ноде: поллинг снапшота job'а до финала. */
+    watch(jobId) {
+        clearInterval(this._timer);
+        const tick = async () => {
+            let snap;
+            try { snap = await gr.get(`/jobs/${jobId}`); }
+            catch (e) { clearInterval(this._timer); this._timer = null; return; }
+            this.renderJob(snap);
+            if (snap.finished || ["COMPLETE", "FAILED", "PARTIAL", "CANCELLED"].includes(snap.state)) {
+                clearInterval(this._timer);
+                this._timer = null;
+            }
+        };
+        this._timer = setInterval(tick, 3000);
+        tick();
+    }
+
+    renderJob(snap) {
+        const box = this.progress;
+        box.innerHTML = "";
+        if (!snap) return;
+        const row = el("div", { class: "gr-job" });
+        row.appendChild(el("div", { class: "gr-job-head" },
+            `<b>${esc(snap.label || snap.job_id)}</b> <span class="gr-muted">${esc(snap.state)}</span>`));
+        for (const u of snap.units || []) {
+            const pct = u.progress && u.progress[1]
+                ? ` · ${Math.round(u.progress[0] / u.progress[1] * 100)}%` : "";
+            row.appendChild(el("div", { class: "gr-muted gr-unit" },
+                `${esc(u.label || `стадия ${u.index}`)} · ${esc(u.state)}${pct}`
+                + (u.error ? ` · <span class="gr-err">${esc(u.error)}</span>` : "")));
+        }
+        const finished = ["COMPLETE", "FAILED", "PARTIAL", "CANCELLED"].includes(snap.state);
+        if (!finished) {
+            const cancel = el("button", { class: "gr-btn gr-small gr-danger" }, "Отменить");
+            cancel.onclick = () => gr.post(`/jobs/${snap.job_id}/cancel`).catch(() => {});
+            row.appendChild(cancel);
+        }
+        box.appendChild(row);
+    }
+
     onConfigure() { this._report = null; this.renderReport(); }
-    dispose() {}
+    dispose() { clearInterval(this._timer); }
 }
 
 // ---------------------------------------------------------------- регистрация
@@ -411,17 +567,41 @@ class PipelineNodeUI {
 const BUILDERS = {
     [NODE_STORY]: (node) => new ProjectNodeUI(node, {
         runLabel: "План ▶",
-        runTitle: "разобрать сюжет на сегменты (LLM или эвристика); ничего не рендерится",
+        runTitle: "разобрать сюжет на сегменты с таймингом (LLM или эвристика); "
+            + "ничего не рендерится",
         errTitle: "План не составлен",
-        hint: "Шаблон сегмента = текущий канвас: два LoadImage с заголовками "
-            + "GPURAID:START_IMAGE / GPURAID:END_IMAGE (FLF2V) и Save-нода видео.",
+        stage: "story",
+        hint: "Раскадровка и Видеоряд подключаются коннектором (или дропдауном «проект:»).",
         size: { width: 540, height: 620, minHeight: 320 },
         onRun: runStoryPlan,
     }),
+    [NODE_STORYBOARD]: (node) => {
+        wireSettingWidget(node, "continuity_mode", "storyboard_settings");
+        return new ProjectNodeUI(node, {
+            stage: "storyboard",
+            hint: "Шаблон кадра — «Шаблон кадра из канвы» ниже (свой T2I-workflow на "
+                + "канве: GPURAID:PROMPT + Save-нода) или встроенный дефолт (Z-Image). "
+                + "Непрерывность стиля — style_bible в ноде Истории.",
+            size: { width: 540, height: 520, minHeight: 280 },
+        });
+    },
+    [NODE_VIDEOSEQ]: (node) => {
+        for (const name of ["prompt_format", "preview_short_edge", "preview_steps"]) {
+            wireSettingWidget(node, name, "video_settings");
+        }
+        return new ProjectNodeUI(node, {
+            stage: "videoseq",
+            hint: "Шаблон сегмента — «Шаблон сегмента из канвы» ниже (FLF2V-workflow на "
+                + "канве: GPURAID:START_IMAGE/END_IMAGE + Save-видео-нода, опционально "
+                + "GPURAID:STEPS для дешёвого черновика).",
+            size: { width: 540, height: 560, minHeight: 300 },
+        });
+    },
     [NODE_LV]: (node) => new ProjectNodeUI(node, {
         runLabel: "Собрать ▶",
         runTitle: "запустить сборку длинного видео по параметрам ноды",
         errTitle: "Длинное видео не запущено",
+        stage: "chain",
         hint: "Шаблон сегмента = текущий канвас (маркеры GPURAID:START_IMAGE, "
             + "GPURAID:END_IMAGE, GPURAID:PROMPT, GPURAID:VIDEO_OUT).",
         size: { width: 540, height: 560, minHeight: 300 },
@@ -431,6 +611,8 @@ const BUILDERS = {
     [NODE_PIPELINE]: (node) => new PipelineNodeUI(node),
     [NODE_MODELS]: (node) => new ModelsNodeUI(
         node, nodeBody(node, { width: 560, height: 420, minHeight: 220 })),
+    [NODE_WORKERS]: (node) => new WorkersNodeUI(
+        node, nodeBody(node, { width: 560, height: 540, minHeight: 260 })),
 };
 
 app.registerExtension({
@@ -459,6 +641,13 @@ app.registerExtension({
             try { this.__gr?.dispose?.(); } catch (e) { /* ignore */ }
             this.__gr = null;
             return origRemoved?.apply(this, arguments);
+        };
+
+        const origConnChange = nodeType.prototype.onConnectionsChange;
+        nodeType.prototype.onConnectionsChange = function () {
+            const r = origConnChange?.apply(this, arguments);
+            try { this.__gr?.onConnectionsChange?.(...arguments); } catch (e) { /* ignore */ }
+            return r;
         };
     },
 });

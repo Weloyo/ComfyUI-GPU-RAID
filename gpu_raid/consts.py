@@ -22,20 +22,39 @@ FORWARD_HEADERS = ("CF-Connecting-IP", "X-Forwarded-For", "X-Real-IP")
 NODE_DISTRIBUTOR = "GPURAID_Distributor"
 NODE_COLLECTOR = "GPURAID_Collector"
 NODE_TILED_UPSCALE = "GPURAID_TiledUpscale"
-NODE_STORY_DIRECTOR = "GPURAID_StoryDirector"
+NODE_STORY = "GPURAID_Story"
+NODE_STORYBOARD = "GPURAID_Storyboard"
+NODE_VIDEOSEQ = "GPURAID_VideoSequence"
 NODE_LONG_VIDEO = "GPURAID_LongVideo"
 NODE_OFFLOAD = "GPURAID_Offload"
 NODE_PIPELINE = "GPURAID_Pipeline"
 NODE_MODELS = "GPURAID_Models"
+NODE_WORKERS = "GPURAID_Workers"
 NODE_VIDEO_SPEC = "GPURAID_VideoSpec"       # НЕ в GPURAID_CLASSES: выполняется и на воркерах
 NODE_SAVE_BUNDLE = "GPURAID_SaveBundle"     # тоже выполняются на воркерах (шардинг)
 NODE_LOAD_BUNDLE = "GPURAID_LoadBundle"
 
+# тип коннектора между Историей/Раскадровкой/Видеорядом — по нему течёт только
+# ссылка (label проекта), не тяжёлые данные; сами данные — в манифесте на диске
+GPURAID_PROJECT_TYPE = "GPURAID_PROJECT"
+
+# свойство ноды-лоадера с привязкой «модель → рантайм»
+# ("" | "local" | "platform:<имя>" | "id:<worker_id>", см. placement.py)
+RUNTIME_PROP = "gpuraid_runtime"
+
+# тип коннектора «Воркеры → лоадер»: провод от выхода-рантайма ноды Воркеров
+# ко входу лоадера И ЕСТЬ привязка (фронтенд пишет её в RUNTIME_PROP);
+# данные по нему не текут, из API-графов такие линки вычищает strip_markers
+GPURAID_RUNTIME_TYPE = "GPURAID_RUNTIME"
+
 # «Маркеры» — ноды-пульты мастера: ничего не вычисляют, живут только на канве и
-# вырезаются из ЛЮБОГО графа перед отправкой куда бы то ни было. Сценарист
-# отдаёт наружу текст сюжета, остальные вообще без выходов.
-GPURAID_MARKER_CLASSES = (NODE_STORY_DIRECTOR, NODE_LONG_VIDEO, NODE_OFFLOAD,
-                          NODE_PIPELINE, NODE_MODELS)
+# вырезаются из ЛЮБОГО графа перед отправкой куда бы то ни было. История
+# отдаёт наружу текст сюжета, остальные вообще без выходов (не считая
+# GPURAID_PROJECT — он коннектится только к другим маркерам, которые тем же
+# проходом и вырезаются, литерализовать нечего).
+GPURAID_MARKER_CLASSES = (NODE_STORY, NODE_STORYBOARD, NODE_VIDEOSEQ,
+                          NODE_LONG_VIDEO, NODE_OFFLOAD, NODE_PIPELINE, NODE_MODELS,
+                          NODE_WORKERS)
 GPURAID_CLASSES = (NODE_DISTRIBUTOR, NODE_COLLECTOR, NODE_TILED_UPSCALE
                    ) + GPURAID_MARKER_CLASSES
 
@@ -51,6 +70,7 @@ LV_END = "GPURAID:END_IMAGE"
 LV_PROMPT = "GPURAID:PROMPT"
 LV_OUT = "GPURAID:VIDEO_OUT"
 LV_KEYFRAME_OUT = "GPURAID:KEYFRAME_OUT"
+LV_STEPS = "GPURAID:STEPS"      # опционально: узел кол-ва шагов сэмплера (для дешёвого preview)
 
 # аспекты для VideoSpec/Сценариста
 ASPECTS = ("16:9", "9:16", "1:1", "4:3", "3:4", "21:9")
@@ -113,6 +133,7 @@ VIDEO_HINTS = (
 # какие ключи считаем текстом промпта / сидом при инъекции в Long Video
 TEXT_KEYS = ("text", "prompt", "positive_prompt", "string", "value", "caption")
 SEED_KEYS = ("seed", "noise_seed")
+STEPS_KEYS = ("steps",)
 
 DEFAULT_SETTINGS = {
     "max_retries": 2,
@@ -133,6 +154,10 @@ DEFAULT_SETTINGS = {
         "idle_stop_min": 10,
         "budget_min": 0,           # 0 = без потолка длительности сессии
         "auto_start_kaggle": False,
+        # сценарии по платформам: {"colab": {"policy": "keep", "idle_stop_min": 5}}
+        # ("inherit"/пусто = глобальная политика). Правятся из нод-лоадеров и
+        # переживают перерождение сессий (id воркера меняется, платформа — нет).
+        "platform_overrides": {},
     },
     # OpenAI-совместимый endpoint для «Сценариста» (ключ — в secrets.json)
     "llm": {

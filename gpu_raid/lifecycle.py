@@ -76,6 +76,12 @@ class Lifecycle:
         # иначе тик за тиком мастер долбится в мёртвый туннель и спамит тостами
         return [r for r in REGISTRY.records(include_local=False) if r.get("enabled")]
 
+    def _cfg_for(self, cfg, record):
+        """Политика конкретного воркера: глобальная -> платформа -> запись."""
+        st = REGISTRY.status.get(record["id"], {})
+        platform = record.get("platform") or st.get("platform") or ""
+        return rules.effective_policy(cfg, platform, record.get("lifecycle"))
+
     async def tick(self):
         cfg = REGISTRY.settings().get("lifecycle") or {}
         # сами опрашиваем прогресс закачек моделей: иначе статус двигает только
@@ -94,7 +100,7 @@ class Lifecycle:
             now = time.time()
             busy = self._global_busy()
             view = self._view(record, now, busy)
-            decision, reason = rules.decide(cfg, view, now)
+            decision, reason = rules.decide(self._cfg_for(cfg, record), view, now)
             if decision == rules.STOP:
                 await self.stop_worker(record, reason)
 
@@ -106,7 +112,7 @@ class Lifecycle:
         out = []
         for record in self._managed_records():
             view = self._view(record, now, busy)
-            decision, reason = rules.decide(cfg, view, now)
+            decision, reason = rules.decide(self._cfg_for(cfg, record), view, now)
             out.append({
                 "id": record["id"], "name": record["name"],
                 "kind": view["kind"], "pinned": view["pinned"], "state": view["state"],

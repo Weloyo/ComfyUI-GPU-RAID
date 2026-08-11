@@ -1,132 +1,15 @@
-// Модели: библиотека публичных ссылок (панель) и рассылка на воркеров (нода).
+// Модели на воркерах: сверка графа с инвентарём и рассылка (нода на канве).
 //
-// Сами модели выбираются как обычно — в лоадерах на канве. Здесь только ответ на
-// вопрос «у кого из воркеров этого файла нет» и кнопка, после которой каждый
-// воркер тянет файл сам с публичной ссылки, мимо канала мастера.
+// Сами модели выбираются как обычно — в лоадерах на канве; там же (кнопка 🔗
+// в runtime-блоке лоадера) задаются публичные ссылки-источники. Здесь только
+// ответ на вопрос «у кого из воркеров этого файла нет» и кнопка, после которой
+// каждый воркер тянет файл сам с публичной ссылки, мимо канала мастера.
 import { app } from "../../../scripts/app.js";
 import { gr, toast } from "./api.js";
-import { el, esc, fmtGb } from "./format.js";
-
-export const FOLDERS = [
-    "diffusion_models", "checkpoints", "text_encoders", "vae", "loras",
-    "controlnet", "upscale_models", "clip_vision", "unet", "embeddings",
-    "style_models", "gligen", "audio_encoders", "model_patches",
-];
+import { el, esc } from "./format.js";
 
 function gb(bytes) {
     return (bytes / 1073741824).toFixed(1);
-}
-
-function folderSelect(value) {
-    const sel = el("select", { class: "gr-select" });
-    for (const f of FOLDERS) sel.appendChild(el("option", { value: f }, f));
-    if (value) sel.value = value;
-    return sel;
-}
-
-// --------------------------------------------------------------- библиотека
-
-export class ModelLibraryUI {
-    constructor(root) {
-        this.root = root;
-        this.models = [];
-        this.build();
-        this.refresh();
-    }
-
-    build() {
-        this.root.innerHTML = "";
-        this.root.appendChild(el("div", { class: "gr-muted" },
-            "Ссылки, по которым воркеры качают модели сами. Нужна прямая "
-            + "публичная ссылка: Hugging Face «Download» (…/resolve/…) или "
-            + "Civitai «Copy link» (…/api/download/models/…). Один раз вписал — "
-            + "расширение больше не спросит."));
-
-        this.url = el("input", { class: "gr-input",
-            placeholder: "https://huggingface.co/…/resolve/main/model.safetensors" });
-        this.name = el("input", { class: "gr-input", placeholder: "имя файла (подставится само)" });
-        this.folder = folderSelect("diffusion_models");
-        this.url.onchange = () => {
-            if (!this.name.value.trim()) {
-                const guess = this.url.value.split("?")[0].split("#")[0]
-                    .replace(/\/+$/, "").split("/").pop();
-                if (/\.(safetensors|ckpt|pt|pth|bin|gguf|onnx|sft)$/i.test(guess)) {
-                    this.name.value = guess;
-                }
-            }
-        };
-        const add = el("button", { class: "gr-btn gr-primary" }, "Добавить");
-        add.onclick = () => this.add(add);
-        this.root.appendChild(this.url);
-        this.root.appendChild(this.row("Файл", this.name));
-        this.root.appendChild(this.row("Папка", this.folder, add));
-        this.list = el("div", { class: "gr-modellist" });
-        this.root.appendChild(this.list);
-    }
-
-    row(label, ...controls) {
-        const r = el("div", { class: "gr-row" });
-        r.appendChild(el("span", { class: "gr-label" }, esc(label)));
-        for (const c of controls) r.appendChild(c);
-        return r;
-    }
-
-    async refresh() {
-        try {
-            this.models = (await gr.get("/models/library")).models || [];
-        } catch (e) { return; }
-        this.render();
-    }
-
-    async add(btn) {
-        btn.disabled = true;
-        try {
-            const r = await gr.post("/models/library", {
-                url: this.url.value.trim(),
-                filename: this.name.value.trim(),
-                folder: this.folder.value,
-            });
-            this.models = r.models || this.models;
-            if (r.warning) toast("warn", "Ссылка принята, но подозрительная", r.warning, 10000);
-            else toast("success", "Источник добавлен", r.entry.filename);
-            this.url.value = "";
-            this.name.value = "";
-            this.render();
-        } catch (e) {
-            toast("error", "Не добавлено", e.message, 8000);
-        } finally { btn.disabled = false; }
-    }
-
-    render() {
-        this.list.innerHTML = "";
-        if (!this.models.length) {
-            this.list.appendChild(el("div", { class: "gr-muted" }, "пусто"));
-            return;
-        }
-        for (const m of this.models) {
-            const row = el("div", { class: "gr-modelrow" });
-            row.appendChild(el("span", { class: "gr-grow" },
-                `<b>${esc(m.filename)}</b> <span class="gr-muted">${esc(m.folder)}`
-                + (m.size_gb ? ` · ${esc(String(m.size_gb))} ГБ` : "")
-                + (m.builtin ? " · встроенная" : "") + "</span>"));
-            const open = el("a", { class: "gr-btn gr-small", href: m.url, target: "_blank",
-                rel: "noopener noreferrer", title: m.url }, "↗");
-            row.appendChild(open);
-            if (!m.builtin) {
-                const del = el("button", { class: "gr-btn gr-small gr-danger" }, "✕");
-                del.onclick = async () => {
-                    try {
-                        const r = await gr.del(
-                            `/models/library/${encodeURIComponent(m.folder)}/${encodeURIComponent(m.filename)}`);
-                        this.models = r.models || this.models;
-                        this.render();
-                    } catch (e) { toast("error", "Не удалено", e.message); }
-                };
-                row.appendChild(del);
-            }
-            this.list.appendChild(row);
-        }
-    }
 }
 
 // --------------------------------------------------------------- нода
@@ -150,8 +33,9 @@ export class ModelsNodeUI {
         bar.append(this.scanBtn, this.sendBtn);
         this.box.appendChild(bar);
         this.box.appendChild(el("div", { class: "gr-muted gr-node-hint" },
-            "Модели выбираются в обычных лоадерах на канве. Ссылки на файлы — "
-            + "панель GPU RAID → «Модели»."));
+            "Модели выбираются в обычных лоадерах на канве. Ссылка-источник "
+            + "файла — кнопка 🔗 в runtime-блоке лоадера (или ниже, если "
+            + "ссылки нет)."));
         this.report = el("div", { class: "gr-node-report" });
         this.box.appendChild(this.report);
         this.progress = el("div", { class: "gr-progress" });

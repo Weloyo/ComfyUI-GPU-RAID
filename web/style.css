@@ -134,6 +134,14 @@
 .gr-progress { display: flex; flex-direction: column; gap: 4px; }
 .gr-empty { padding: 8px 2px; }
 
+/* runtime-блок в нодах-лоадерах: привязка «модель → воркер» */
+.gr-loader { overflow: visible; gap: 4px; }
+.gr-loader-status { font-size: 11px; line-height: 1.3; padding-left: 15px; }
+.gr-loader-models { display: flex; flex-direction: column; gap: 3px; }
+.gr-loader-model { display: flex; flex-direction: column; gap: 3px; }
+.gr-loader-file { font-size: 11px; }
+.gr-loader .gr-chip { flex: none; min-width: 14px; text-align: center; }
+
 /* внутри ноды места больше, чем в узком сайдбаре — превью крупнее */
 .gr-node .gr-video { width: 200px; max-height: 130px; }
 .gr-node .gr-kf { flex: 0 0 190px; }

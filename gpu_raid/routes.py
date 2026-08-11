@@ -16,7 +16,7 @@ from aiohttp import web
 import server
 
 from . import (auth, config, distribute, downloads, events, kaggle_api, modelsrc,
-               parity, providers, results, storyplan)
+               parity, providers, results, runtimectl, storyplan)
 from . import longvideo as lv
 from . import pipeline
 from . import secrets as secret_store
@@ -381,6 +381,67 @@ async def workers_download_status(request):
 
 
 # ---------------------------------------------------------------------------
+# runtime: привязки «модель → воркер» в нодах-лоадерах
+# ---------------------------------------------------------------------------
+
+@routes.get("/gpuraid/runtime/options")
+async def runtime_options(request):
+    _guard_master(request)
+    return web.json_response(runtimectl.options())
+
+
+@routes.post("/gpuraid/runtime/status")
+async def runtime_status(request):
+    _guard_master(request)
+    data = await _json(request)
+    try:
+        return web.json_response(await runtimectl.status(data.get("items") or []))
+    except Exception as e:
+        log.exception("runtime status failed")
+        return _err(500, e)
+
+
+@routes.post("/gpuraid/runtime/start")
+async def runtime_start(request):
+    _guard_master(request)
+    data = await _json(request)
+    try:
+        return web.json_response(await runtimectl.start(data.get("assign")))
+    except RewriteError as e:
+        return _err(409, e)
+    except Exception as e:
+        log.exception("runtime start failed")
+        return _err(500, e)
+
+
+@routes.post("/gpuraid/runtime/stop")
+async def runtime_stop(request):
+    _guard_master(request)
+    data = await _json(request)
+    try:
+        return web.json_response(await runtimectl.stop(data.get("assign")))
+    except RewriteError as e:
+        return _err(409, e)
+    except Exception as e:
+        log.exception("runtime stop failed")
+        return _err(500, e)
+
+
+@routes.post("/gpuraid/runtime/scenario")
+async def runtime_scenario(request):
+    _guard_master(request)
+    data = await _json(request)
+    try:
+        return web.json_response(
+            await runtimectl.set_scenario(data.get("assign"), data.get("scenario")))
+    except RewriteError as e:
+        return _err(409, e)
+    except Exception as e:
+        log.exception("runtime scenario failed")
+        return _err(500, e)
+
+
+# ---------------------------------------------------------------------------
 # lifecycle / rendezvous / kaggle
 # ---------------------------------------------------------------------------
 
@@ -564,13 +625,15 @@ async def catalog(request):
     return web.json_response({"catalog": MODEL_CATALOG})
 
 
+# корневой example_workflows/ виден и нативной витрине шаблонов ComfyUI
+# (Workflow → Browse Templates), и этому роуту
 _EXAMPLES_DIR = os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))),
-                             "docs", "example_workflows")
+                             "example_workflows")
 
 
 @routes.get("/gpuraid/example/{name}")
 async def example_workflow(request):
-    """Пример-workflow из docs/example_workflows (whitelist по именам файлов)."""
+    """Пример-workflow из example_workflows (whitelist по именам файлов)."""
     _guard_master(request)
     name = config.sanitize_name(request.match_info["name"])
     path = os.path.join(_EXAMPLES_DIR, f"{name}.json")
@@ -767,7 +830,7 @@ async def pipeline_analyze(request):
     if not isinstance(graph, dict) or not graph:
         return _err(400, "graph отсутствует")
     try:
-        report = await pipeline.analyze(graph)
+        report = await pipeline.analyze(graph, data.get("workflow_ui"))
     except RewriteError as e:
         return _err(409, e)
     except Exception as e:
@@ -804,13 +867,8 @@ async def pipeline_start(request):
 async def story_plan(request):
     _guard_master(request)
     data = await _json(request)
-    graph = data.get("graph")
-    if not isinstance(graph, dict) or not graph:
-        return _err(400, "graph отсутствует")
     try:
-        manifest = await story.plan(graph, data.get("params") or {},
-                                    data.get("keyframe_graph"),
-                                    data.get("client_id") or "")
+        manifest = await story.plan(data.get("params") or {}, data.get("client_id") or "")
     except RewriteError as e:
         return _err(409, e)
     except Exception as e:
@@ -834,6 +892,42 @@ async def story_kf_template(request):
     return web.json_response({"ok": True})
 
 
+@routes.post("/gpuraid/story/{label}/segment_template")
+async def story_seg_template(request):
+    _guard_master(request)
+    data = await _json(request)
+    graph = data.get("graph")
+    if not isinstance(graph, dict) or not graph:
+        return _err(400, "graph отсутствует")
+    try:
+        await story.set_segment_template(request.match_info["label"], graph)
+    except RewriteError as e:
+        return _err(409, e)
+    return web.json_response({"ok": True})
+
+
+@routes.patch("/gpuraid/story/{label}/video_settings")
+async def story_video_settings_patch(request):
+    _guard_master(request)
+    data = await _json(request)
+    try:
+        vs = await story.update_video_settings(request.match_info["label"], data)
+    except RewriteError as e:
+        return _err(409, e)
+    return web.json_response({"video_settings": vs})
+
+
+@routes.patch("/gpuraid/story/{label}/storyboard_settings")
+async def story_storyboard_settings_patch(request):
+    _guard_master(request)
+    data = await _json(request)
+    try:
+        ss = await story.update_storyboard_settings(request.match_info["label"], data)
+    except RewriteError as e:
+        return _err(409, e)
+    return web.json_response({"storyboard_settings": ss})
+
+
 @routes.post("/gpuraid/story/{label}/keyframes/render")
 async def story_kf_render(request):
     _guard_master(request)
@@ -854,16 +948,19 @@ async def story_kf_render(request):
 async def story_render(request):
     _guard_master(request)
     data = await _json(request)
+    variant = data.get("variant") or "final"
+    if variant not in ("final", "preview"):
+        return _err(400, "variant должен быть final или preview")
     try:
         job = await story.render_segments(request.match_info["label"],
-                                          data.get("indices"),
+                                          data.get("indices"), variant,
                                           data.get("client_id") or "")
     except RewriteError as e:
         return _err(409, e)
     except Exception as e:
         log.exception("story render failed")
         return _err(500, e)
-    return web.json_response({"job_id": job.job_id})
+    return web.json_response({"job_id": job.job_id, "variant": variant})
 
 
 @routes.patch("/gpuraid/story/{label}/keyframes/{index}")

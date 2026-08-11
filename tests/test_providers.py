@@ -108,7 +108,9 @@ def test_configured_flags():
 
 def test_status_view_hides_secrets():
     orig = providers._kaggle_creds
-    providers._kaggle_creds = lambda: ("weloyo", "секрет")
+    # канарейка должна быть словом, которого нет в легитимных текстах UI
+    # (слово «секрет» там теперь встречается — карточка Colab Secrets)
+    providers._kaggle_creds = lambda: ("weloyo", "kgat-канарейка-9257")
     try:
         view = providers.status_view(
             {"llm": {"base_url": "http://x/v1", "model": "m"},
@@ -120,7 +122,7 @@ def test_status_view_hides_secrets():
         providers._kaggle_creds = orig
 
     dumped = repr(view)
-    assert "секрет" not in dumped, "ключ Kaggle не должен утекать в UI"
+    assert "kgat-канарейка-9257" not in dumped, "ключ Kaggle не должен утекать в UI"
     by_id = {p["id"]: p for p in view["providers"]}
     assert by_id["llm"]["values"] == {"base_url": "http://x/v1", "model": "m"}
     assert by_id["llm"]["check"] == {"ok": True, "detail": "3 модели", "ts": 5}

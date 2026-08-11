@@ -7,6 +7,14 @@ import os
 import sys
 import traceback
 
+# консоль Windows может быть cp1252 — а код печатает кириллицу и стрелки
+# (worker_bootstrap «печатает улики»); без utf-8 тесты падают не по делу
+for stream in (sys.stdout, sys.stderr):
+    try:
+        stream.reconfigure(encoding="utf-8", errors="replace")
+    except Exception:
+        pass
+
 _TESTS = os.path.dirname(os.path.abspath(__file__))
 # embedded-питон портабла (python313._pth) не добавляет каталог скрипта сам
 sys.path.insert(0, _TESTS)
@@ -20,6 +28,7 @@ import test_lifecycle_rules  # noqa: E402
 import test_modelsrc  # noqa: E402
 import test_parity  # noqa: E402
 import test_pipeline_split  # noqa: E402
+import test_placement  # noqa: E402
 import test_providers  # noqa: E402
 import test_rendezvous  # noqa: E402
 import test_storyplan  # noqa: E402
@@ -28,8 +37,8 @@ import test_worker_client  # noqa: E402
 
 MODULES = [test_bundle, test_config, test_downloads, test_graph_rewrite,
            test_lifecycle_rules, test_modelsrc, test_parity, test_pipeline_split,
-           test_providers, test_rendezvous, test_storyplan, test_worker_bootstrap,
-           test_worker_client]
+           test_placement, test_providers, test_rendezvous, test_storyplan,
+           test_worker_bootstrap, test_worker_client]
 
 
 def main():

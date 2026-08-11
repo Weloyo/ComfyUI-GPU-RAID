@@ -115,19 +115,25 @@ def test_heuristic_split_auto_and_empty():
 def test_parse_llm_plan_dirty():
     raw = """Вот план:
 ```json
-{"style": "cinematic, 35mm", "segments": [
+{"style_bible": "cinematic, 35mm", "segments": [
   {"prompt": "boat departs", "keyframe_prompt": "boat at pier", "duration_s": "5"},
   {"prompt": "storm hits", "duration_s": null},
   {"no_prompt": true}
 ], "final_keyframe_prompt": "calm harbor"}
 ```"""
     plan = storyplan.parse_llm_plan(raw)
-    assert plan["style"] == "cinematic, 35mm"
+    assert plan["style_bible"] == "cinematic, 35mm"
     assert len(plan["segments"]) == 2
     assert plan["segments"][0]["duration_s"] == 5.0
     assert plan["segments"][1]["duration_s"] is None
     assert plan["segments"][1]["keyframe_prompt"] == "storm hits"  # fallback на prompt
     assert plan["final_keyframe_prompt"] == "calm harbor"
+
+
+def test_parse_llm_plan_legacy_style_key():
+    """Старое поле "style" (до переименования в style_bible) не должно ронять парсер."""
+    plan = storyplan.parse_llm_plan('{"style": "old key", "segments": [{"prompt": "a"}]}')
+    assert plan["style_bible"] == "old key"
 
 
 def test_parse_llm_plan_garbage():
@@ -145,7 +151,7 @@ def _vid():
 
 
 def test_new_story_manifest_structure():
-    plan = {"style": "night city", "segments": [
+    plan = {"style_bible": "night city", "segments": [
         {"prompt": "a", "keyframe_prompt": "ka", "duration_s": None},
         {"prompt": "b", "keyframe_prompt": "kb", "duration_s": 3.0},
     ], "final_keyframe_prompt": "final"}
@@ -153,9 +159,13 @@ def test_new_story_manifest_structure():
     assert m["schema"] == 2 and m["mode"] == "story" and m["state"] == "draft"
     assert len(m["segments"]) == 2
     assert len(m["keyframes"]) == 3          # N+1
-    # стиль вшит в промпты
-    assert m["segments"][0]["prompt"] == "night city. a"
-    assert m["keyframes"][2]["prompt"] == "night city. final"
+    # style_bible — отдельное поле, промпты остаются сырыми (не запекаются)
+    assert m["style_bible"] == "night city"
+    assert m["segments"][0]["prompt"] == "a"
+    assert m["keyframes"][2]["prompt"] == "final"
+    assert m["final_preview"] is None
+    assert m["video_settings"]["prompt_format"] == "minimax_h3"
+    assert m["storyboard_settings"]["continuity_mode"] == "style_only"
     # сегмент i соединяет кадры i и i+1
     assert m["segments"][1]["start_kf"] == 1 and m["segments"][1]["end_kf"] == 2
     # длительности: дефолт из spec и явная из плана
@@ -171,8 +181,8 @@ def test_new_story_manifest_structure():
 
 def test_mark_stale():
     m = storyplan.new_story_manifest("lbl", "s", {
-        "style": "", "segments": [{"prompt": "a", "keyframe_prompt": "a", "duration_s": None},
-                                  {"prompt": "b", "keyframe_prompt": "b", "duration_s": None}],
+        "style_bible": "", "segments": [{"prompt": "a", "keyframe_prompt": "a", "duration_s": None},
+                                        {"prompt": "b", "keyframe_prompt": "b", "duration_s": None}],
         "final_keyframe_prompt": "f"}, _vid(), 0)
     m["segments"][0]["status"] = "done"
     m["segments"][1]["status"] = "done"
@@ -180,9 +190,57 @@ def test_mark_stale():
     assert sorted(touched) == [0, 1]
     assert m["segments"][0]["stale"] and m["segments"][1]["stale"]
     m2 = storyplan.new_story_manifest("l", "s", {
-        "style": "", "segments": [{"prompt": "a", "keyframe_prompt": "a", "duration_s": None}],
+        "style_bible": "", "segments": [{"prompt": "a", "keyframe_prompt": "a", "duration_s": None}],
         "final_keyframe_prompt": "f"}, _vid(), 0)
     assert storyplan.mark_stale_for_keyframe(m2, 0) == []   # draft-сегменты не трогаем
+
+
+def test_clamp_segment_duration_caps_each_segment():
+    segs = [{"duration_s": 20.0}, {"duration_s": 8.0}, {"duration_s": 3.0}]
+    storyplan.clamp_segment_and_total_duration(segs, max_segment_s=15.0)
+    assert [s["duration_s"] for s in segs] == [15.0, 8.0, 3.0]
+
+
+def test_clamp_total_duration_scales_proportionally_not_truncates():
+    segs = [{"duration_s": 10.0}, {"duration_s": 10.0}, {"duration_s": 10.0}]
+    storyplan.clamp_segment_and_total_duration(segs, max_total_s=15.0)
+    # все три сегмента сжаты вдвое, ни один не обнулён/не выброшен
+    assert len(segs) == 3
+    assert all(s["duration_s"] == 5.0 for s in segs)
+
+
+def test_clamp_duration_both_ceilings_combined():
+    segs = [{"duration_s": 20.0}, {"duration_s": 20.0}]
+    storyplan.clamp_segment_and_total_duration(segs, max_segment_s=15.0, max_total_s=20.0)
+    # сперва по-сегментно клампится к 15+15=30, затем пропорционально к 20
+    assert sum(s["duration_s"] for s in segs) - 20.0 < 1e-9
+
+
+def test_clamp_duration_noop_without_ceilings():
+    segs = [{"duration_s": 20.0}]
+    storyplan.clamp_segment_and_total_duration(segs)
+    assert segs[0]["duration_s"] == 20.0
+
+
+def test_scene_timeline_cumulative():
+    segs = [{"index": 0, "duration_s": 5.0}, {"index": 1, "duration_s": 3.5}]
+    tl = storyplan.scene_timeline(segs)
+    assert tl == [{"index": 0, "start_s": 0.0, "end_s": 5.0},
+                  {"index": 1, "start_s": 5.0, "end_s": 8.5}]
+
+
+def test_format_minimax_segment_prompt_shape():
+    p = storyplan.format_minimax_segment_prompt("the door slowly opens", 6.0, "night city, neon")
+    assert p.startswith("[Shot 1] night city, neon.")
+    assert "Picture 1 (from Shot 1) aligns with the 0.00-second mark" in p
+    assert "Picture 2 (from Shot 1) aligns with the 6.00-second mark" in p
+    assert p.rstrip().endswith("the door slowly opens")
+
+
+def test_format_minimax_segment_prompt_without_style_bible():
+    p = storyplan.format_minimax_segment_prompt("cut to black", 1.5, "")
+    assert p.startswith("[Shot 1] Picture 1")
+    assert "1.50-second mark" in p
 
 
 def test_llm_timeout_falls_back_to_default():

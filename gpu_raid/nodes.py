@@ -1,10 +1,13 @@
 """Ноды GPU RAID.
 
 Две группы. «Рабочие» (Distributor/Collector/TiledUpscale/VideoSpec/Save-LoadBundle)
-реально что-то считают и уезжают на воркеров. «Маркеры» (StoryDirector, LongVideo,
-Offload, Pipeline) — пульты управления мастером прямо на канве: они ничего не
-вычисляют, весь их UI живёт во фронтенде (web/lib/nodeui.js), а из любого графа
-перед отправкой они вырезаются (graph_rewrite.strip_markers).
+реально что-то считают и уезжают на воркеров. «Маркеры» (Story/Storyboard/
+VideoSequence, LongVideo, Offload, Pipeline) — пульты управления мастером
+прямо на канве: они ничего не вычисляют, весь их UI живёт во фронтенде
+(web/lib/nodeui.js), а из любого графа перед отправкой они вырезаются
+(graph_rewrite.strip_markers). Story/Storyboard/VideoSequence дополнительно
+связаны коннектором GPURAID_PROJECT — по нему течёт только ссылка (label
+проекта), сами данные остаются в манифесте на диске.
 """
 
 import logging
@@ -16,10 +19,12 @@ import uuid
 
 log = logging.getLogger("gpu_raid")
 
-from .consts import (ASPECTS, NODE_COLLECTOR, NODE_DISTRIBUTOR, NODE_LOAD_BUNDLE,
+from .consts import (ASPECTS, GPURAID_PROJECT_TYPE, GPURAID_RUNTIME_TYPE,
+                     NODE_COLLECTOR, NODE_DISTRIBUTOR, NODE_LOAD_BUNDLE,
                      NODE_LONG_VIDEO, NODE_MODELS, NODE_OFFLOAD, NODE_PIPELINE,
-                     NODE_SAVE_BUNDLE, NODE_STORY_DIRECTOR, NODE_TILED_UPSCALE,
-                     NODE_VIDEO_SPEC, SAVE_NODE_ID)
+                     NODE_SAVE_BUNDLE, NODE_STORY, NODE_STORYBOARD,
+                     NODE_TILED_UPSCALE, NODE_VIDEO_SPEC, NODE_VIDEOSEQ, NODE_WORKERS,
+                     SAVE_NODE_ID)
 from . import results, storyplan
 
 
@@ -382,23 +387,28 @@ class GPURaidVideoSpec:
         return (int(width), int(height), int(length), int(fps), float(duration_s))
 
 
-class GPURaidStoryDirector:
-    """«Сценарист»: нода-проект с раскадровкой прямо на канве.
+class GPURaidStory:
+    """«История»: сюжет -> раскадровка по времени через LLM (или эвристику).
 
-    Сама нода ничего не рендерит: нажатие Queue (или кнопка «План» в теле ноды)
-    перехватывается расширением — LLM (или эвристика) разбивает сюжет на
-    сегменты. Дальше вся работа идёт в самой ноде: лента ключевых кадров с
-    промптами и превью, сегменты с видео, кнопки рендера и экспорта.
+    Ничего не рендерит: нажатие Queue (или кнопка «План ▶» в теле ноды)
+    перехватывается расширением — LLM разбивает сюжет на сегменты с таймингом
+    (в пределах потолков max_segment_duration_s/max_total_duration_s — сколько
+    длится каждый сегмент решает сам сценарист). model/system_prompt/
+    temperature/max_tokens — «характер» этого конкретного сценариста (можно
+    держать несколько нод Истории с разными характерами под разные сюжеты);
+    base_url/ключ LLM — глобальное подключение, в панели. Раскадровка и
+    Видеоряд подключаются коннектором GPURAID_PROJECT (или дропдауном
+    «проект:» в их теле).
     """
 
     CATEGORY = "GPU RAID"
-    RETURN_TYPES = ("STRING",)
-    RETURN_NAMES = ("story",)
+    RETURN_TYPES = (GPURAID_PROJECT_TYPE, "STRING")
+    RETURN_NAMES = ("project", "story")
     FUNCTION = "run"
-    DESCRIPTION = ("Опишите сюжет — Queue разберёт его на сегменты (first/last кадры "
-                   "+ промпт на сегмент). Раскадровка, промпты, превью и рендер — "
-                   "в теле самой ноды; воркеры считают сегменты параллельно, "
-                   "итог склеивается в одно видео.")
+    DESCRIPTION = ("Опишите сюжет — Queue разберёт его на сегменты с таймингом "
+                   "(first/last кадры + промпт + камера на сегмент, в пределах "
+                   "потолков длительности). Раскадровка и рендер — в подключённых "
+                   "нодах Раскадровка/Видеоряд.")
 
     @classmethod
     def INPUT_TYPES(cls):
@@ -409,13 +419,34 @@ class GPURaidStoryDirector:
                 "segments_count": ("INT", {"default": 0, "min": 0, "max": 64,
                                            "tooltip": "0 = авто (решает LLM/эвристика)"}),
                 "segment_duration_s": ("FLOAT", {"default": 5.0, "min": 0.5, "max": 60.0,
-                                                 "step": 0.5}),
+                                                 "step": 0.5,
+                                                 "tooltip": "ориентир для LLM; фактическую "
+                                                            "длительность каждого сегмента "
+                                                            "решает сценарист в пределах "
+                                                            "потолков ниже"}),
+                "max_segment_duration_s": ("FLOAT", {"default": 15.0, "min": 0.5, "max": 60.0,
+                                                     "step": 0.5,
+                                                     "tooltip": "потолок на ОДИН сегмент "
+                                                                "(H3 физически не считает "
+                                                                "больше ~15с за раз)"}),
+                "max_total_duration_s": ("FLOAT", {"default": 60.0, "min": 1.0, "max": 3600.0,
+                                                   "step": 1.0,
+                                                   "tooltip": "потолок на весь ролик"}),
                 "fps": ("INT", {"default": 24, "min": 1, "max": 120}),
                 "aspect": (list(ASPECTS), {"default": "16:9"}),
                 "short_edge": ("INT", {"default": 768, "min": 64, "max": 4096,
                                        "step": 32}),
                 "snap": (["minimax_h3", "none"], {"default": "minimax_h3"}),
                 "use_llm": ("BOOLEAN", {"default": True}),
+                "model": ("STRING", {"default": "",
+                                     "tooltip": "имя модели у LLM-эндпоинта; пусто = "
+                                                "дефолт из панели «Подключения и ключи»"}),
+                "system_prompt": ("STRING", {"multiline": True, "default": "",
+                                             "tooltip": "характер этого сценариста — жанр, "
+                                                        "стиль подачи, ограничения"}),
+                "temperature": ("FLOAT", {"default": 0.7, "min": 0.0, "max": 2.0, "step": 0.05}),
+                "max_tokens": ("INT", {"default": 0, "min": 0, "max": 1000000,
+                                       "tooltip": "0 = без ограничения (дефолт эндпоинта)"}),
                 "seed": ("INT", {"default": 0, "min": 0, "max": 0xFFFFFFFFFFFFFFFF}),
                 "on_queue": ("BOOLEAN", {"default": True,
                                          "tooltip": "перехватывать Queue: нажатие составляет "
@@ -424,7 +455,90 @@ class GPURaidStoryDirector:
         }
 
     def run(self, story, **_kw):
-        return (str(story or ""),)
+        return (str(story or ""), str(story or ""))
+
+
+class GPURaidStoryboard:
+    """«Раскадровка»: по плану Истории генерирует первый/последний кадр
+    каждого сегмента — T2I, параллельно на всех GPU.
+
+    Шаблон кадра — кнопка «Шаблон кадра из канвы» в теле ноды (свой
+    T2I-workflow на канве, нода промпта с заголовком GPURAID:PROMPT + Save-нода);
+    без него — встроенный дефолт (Z-Image). Непрерывность стиля между кадрами
+    держится на style_bible (задаётся в теле ноды Истории, приклеивается к
+    каждому промпту кадра при рендере) — единственный механизм пока
+    (continuity_mode=style_only); img2img-цепочка кадров — в планах.
+    """
+
+    CATEGORY = "GPU RAID"
+    RETURN_TYPES = (GPURAID_PROJECT_TYPE,)
+    RETURN_NAMES = ("project",)
+    FUNCTION = "run"
+    DESCRIPTION = ("Кадры проекта (первый/последний на сегмент) — T2I, параллельно "
+                   "на всех GPU. Лента кадров, правки, «Шаблон кадра из канвы» — "
+                   "в теле ноды.")
+
+    @classmethod
+    def INPUT_TYPES(cls):
+        return {
+            "required": {
+                "continuity_mode": (["style_only"], {"default": "style_only",
+                                                      "tooltip": "как держать кадры визуально "
+                                                                 "согласованными"}),
+            },
+            "optional": {
+                "project": (GPURAID_PROJECT_TYPE, {}),
+            },
+        }
+
+    def run(self, **_kw):
+        return ("",)
+
+
+class GPURaidVideoSequence:
+    """«Видеоряд»: из пар кадров Раскадровки генерирует видео FLF2V-сегментами
+    — параллельно на всех GPU.
+
+    Шаблон сегмента — кнопка «Шаблон сегмента из канвы» в теле ноды
+    (FLF2V-workflow на канве, GPURAID:START_IMAGE/END_IMAGE + Save-видео-нода,
+    опционально GPURAID:STEPS для дешёвого черновика). prompt_format=minimax_h3
+    строит промпт по официальному формату MiniMax H3 (Shot + выравнивание
+    first/last кадра по секундам); raw — промпт сегмента как есть. Черновик и
+    финал — разными кнопками в теле ноды.
+    """
+
+    CATEGORY = "GPU RAID"
+    RETURN_TYPES = (GPURAID_PROJECT_TYPE,)
+    RETURN_NAMES = ("project",)
+    FUNCTION = "run"
+    DESCRIPTION = ("Сегменты проекта — FLF2V между парами кадров Раскадровки, "
+                   "параллельно на всех GPU. Черновик/финал, монтаж, экспорт — "
+                   "в теле ноды.")
+
+    @classmethod
+    def INPUT_TYPES(cls):
+        return {
+            "required": {
+                "prompt_format": (["minimax_h3", "raw"], {"default": "minimax_h3",
+                                                          "tooltip": "minimax_h3 — официальный "
+                                                                     "формат [Shot]+выравнивание "
+                                                                     "кадров; raw — промпт "
+                                                                     "сегмента как есть"}),
+                "preview_short_edge": ("INT", {"default": 0, "min": 0, "max": 4096, "step": 32,
+                                               "tooltip": "0 = автоматически (половина "
+                                                          "разрешения финала)"}),
+                "preview_steps": ("INT", {"default": 0, "min": 0, "max": 200,
+                                          "tooltip": "0 = без override (нужна нода с "
+                                                     "заголовком GPURAID:STEPS в шаблоне "
+                                                     "сегмента, иначе игнорируется)"}),
+            },
+            "optional": {
+                "project": (GPURAID_PROJECT_TYPE, {}),
+            },
+        }
+
+    def run(self, **_kw):
+        return ("",)
 
 
 class GPURaidLongVideo:
@@ -529,13 +643,43 @@ class GPURaidPipeline:
         return ()
 
 
+class GPURaidWorkers:
+    """«Воркеры»: парк машин и задания — прямо на канве.
+
+    Маркер-нода: список воркеров со статусами, добавление по connection string,
+    быстрый запуск Colab/Kaggle, глобальная политика автостопа и активные
+    задания. Один выход «воркеры» (шина GPURAID_RUNTIME): один и тот же провод
+    тянется от него к каждой ноде-лоадеру — после подключения в лоадере
+    открывается список доступных воркеров, и привязка «модель → рантайм»
+    выбирается там (properties.gpuraid_runtime). Данные по проводу не текут —
+    из графов на исполнение такие линки вычищает strip_markers.
+    """
+
+    CATEGORY = "GPU RAID"
+    RETURN_TYPES = (GPURAID_RUNTIME_TYPE,)
+    RETURN_NAMES = ("воркеры",)
+    FUNCTION = "run"
+    DESCRIPTION = ("Парк GPU: кто в сети, добавление воркеров, автостоп и задания. "
+                   "Выход «воркеры» подключается ко всем нодам-лоадерам — после "
+                   "этого в лоадере появляется список доступных воркеров. "
+                   "Секреты и ключи — в боковой панели.")
+
+    @classmethod
+    def INPUT_TYPES(cls):
+        return {"required": {}}
+
+    def run(self):
+        # нода — маркер, из исполняемых графов вырезается
+        return ("gpuraid",)
+
+
 class GPURaidModels:
     """«Модели на воркерах»: сверка текущего графа с инвентарём и рассылка.
 
     Модели выбираются как обычно — в лоадерах на канве. Эта нода только
     показывает, у кого из воркеров нужных файлов нет, и запускает закачку:
-    каждый воркер тянет файл сам с публичной ссылки из библиотеки (панель →
-    «Модели»), мимо канала мастера.
+    каждый воркер тянет файл сам с публичной ссылки из библиотеки источников
+    (кнопка 🔗 в runtime-блоке лоадера), мимо канала мастера.
     """
 
     CATEGORY = "GPU RAID"
@@ -641,11 +785,14 @@ NODE_CLASS_MAPPINGS = {
     NODE_COLLECTOR: GPURaidCollector,
     NODE_TILED_UPSCALE: GPURaidTiledUpscale,
     NODE_VIDEO_SPEC: GPURaidVideoSpec,
-    NODE_STORY_DIRECTOR: GPURaidStoryDirector,
+    NODE_STORY: GPURaidStory,
+    NODE_STORYBOARD: GPURaidStoryboard,
+    NODE_VIDEOSEQ: GPURaidVideoSequence,
     NODE_LONG_VIDEO: GPURaidLongVideo,
     NODE_OFFLOAD: GPURaidOffload,
     NODE_PIPELINE: GPURaidPipeline,
     NODE_MODELS: GPURaidModels,
+    NODE_WORKERS: GPURaidWorkers,
     NODE_SAVE_BUNDLE: GPURaidSaveBundle,
     NODE_LOAD_BUNDLE: GPURaidLoadBundle,
 }
@@ -655,11 +802,14 @@ NODE_DISPLAY_NAME_MAPPINGS = {
     NODE_COLLECTOR: "GPU RAID Collector",
     NODE_TILED_UPSCALE: "GPU RAID Tiled Upscale",
     NODE_VIDEO_SPEC: "GPU RAID Видео-спека",
-    NODE_STORY_DIRECTOR: "GPU RAID Сценарист (раскадровка)",
+    NODE_STORY: "GPU RAID История",
+    NODE_STORYBOARD: "GPU RAID Раскадровка",
+    NODE_VIDEOSEQ: "GPU RAID Видеоряд",
     NODE_LONG_VIDEO: "GPU RAID Длинное видео",
     NODE_OFFLOAD: "GPU RAID Выполнить на воркере",
     NODE_PIPELINE: "GPU RAID Конвейер (шардинг)",
     NODE_MODELS: "GPU RAID Модели на воркерах",
+    NODE_WORKERS: "GPU RAID Воркеры",
     NODE_SAVE_BUNDLE: "GPU RAID Save Bundle (шардинг)",
     NODE_LOAD_BUNDLE: "GPU RAID Load Bundle (шардинг)",
 }

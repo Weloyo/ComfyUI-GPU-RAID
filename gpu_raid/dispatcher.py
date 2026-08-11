@@ -27,6 +27,7 @@ from .graph_rewrite import (
     rewrite_upload_refs,
     splice_gpuraid,
     strip_annotation,
+    strip_markers,
     validate_stripe,
 )
 from .worker_client import SubmitError
@@ -301,6 +302,10 @@ class JobManager:
     # ------------------------------------------------------------------ stripe
 
     async def start_stripe(self, graph, workflow_ui, client_id):
+        # маркеры (Воркеры/Конвейер/…) могут жить на той же канве, а провод
+        # привязки «Воркеры → лоадер» затянул бы маркер в ветку через
+        # ancestors() — чистим до валидации
+        graph = strip_markers(graph)
         spec = validate_stripe(graph)
         job = Job("stripe", client_id=client_id)
         job.job_type = spec["job_type"]

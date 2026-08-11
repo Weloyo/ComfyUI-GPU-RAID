@@ -1,4 +1,5 @@
-"""E2E Сценариста на CPU: план (эвристика) -> кадры параллельно -> сегменты
+"""E2E Истории/Раскадровки/Видеоряда на CPU: план (эвристика, без графа) ->
+захват шаблонов сегмента и кадра -> кадры параллельно -> сегменты
 FLF2V-шаблоном -> склейка -> правка промпта + перерендер сегмента.
 
 Без моделей: кадры = EmptyImage, сегмент = ImageBatch двух кадров -> CreateVideo
@@ -13,6 +14,7 @@ import shutil
 import sys
 import tempfile
 import time
+import urllib.error
 
 if len(sys.argv) > 1:
     os.environ["GPURAID_E2E_COMFY"] = sys.argv[1]
@@ -75,10 +77,8 @@ def main():
         wait_ready("http://127.0.0.1:8190", headers={"X-GPURAID-Token": TOKEN})
         register_worker(A, TOKEN, 8190, "e2e-w")
 
-        print("[2] план (эвристика, без LLM)…")
+        print("[2] план (эвристика, без LLM, без графа канвы)…")
         _, r = req("POST", A + "/gpuraid/story/plan", {
-            "graph": SEG_TEMPLATE,
-            "keyframe_graph": KF_TEMPLATE,
             "params": {"story": STORY, "label": LABEL, "segments_count": 2,
                        "segment_duration_s": 1.0, "aspect": "1:1", "snap": "none",
                        "fps": 8, "use_llm": False, "seed": 7},
@@ -90,7 +90,21 @@ def main():
         assert m["state"] == "draft" and len(m["segments"]) == 2, m["state"]
         assert len(m["keyframes"]) == 3, "N+1 кадров"
         assert m["segments"][0]["start_image"].endswith("key_000.png")
+        assert m["style_bible"] == "", "эвристика без LLM не пишет style_bible"
         print(f"  план: {len(m['segments'])} сегментов, {len(m['keyframes'])} кадров")
+
+        print("[2b] захват шаблонов — Видеоряд (сегмент) и Раскадровка (кадр)…")
+        _, _ = req("POST", f"{A}/gpuraid/story/{label}/segment_template",
+                   {"graph": SEG_TEMPLATE})
+        _, _ = req("POST", f"{A}/gpuraid/story/{label}/keyframe_template",
+                   {"graph": KF_TEMPLATE})
+        # шаблон теста — общая FLF2V-имитация, не MiniMax H3: просим Видеоряд
+        # не оборачивать промпт в [Shot 1]-формат (это отдельный опт-ин, не
+        # часть общей graph_rewrite-машинерии — см. video_settings.prompt_format)
+        _, vs = req("PATCH", f"{A}/gpuraid/story/{label}/video_settings",
+                   {"prompt_format": "raw"})
+        assert vs["video_settings"]["prompt_format"] == "raw"
+        print("  ok")
 
         print("[3] правка промпта кадра до рендера…")
         _, _ = req("PATCH", f"{A}/gpuraid/story/{label}/keyframes/1",
@@ -134,12 +148,25 @@ def main():
                    {"index": 0, "seed": 99, "prompt": "новый промпт сегмента"})
         job_id = r["job_id"]
         deadline = time.time() + 180
+        snap = None
         while time.time() < deadline:
-            _, snap = req("GET", f"{A}/gpuraid/jobs/{job_id}")
+            try:
+                _, snap = req("GET", f"{A}/gpuraid/jobs/{job_id}")
+            except urllib.error.HTTPError as e:
+                if e.code != 404:
+                    raise
+                # MANAGER._archive убирает job из self.jobs сразу по завершении
+                # (документированно, не баг — /jobs/{id} штатно отвечает
+                # "not found" для уже архивированного); для CPU-рендера в одну
+                # секунду это гонка с самым первым поллом. Манифест к этому
+                # моменту уже обновлён — finally в rerender_segment пишет его
+                # ДО архивации, так что 404 тут означает "уже готово".
+                snap = {"state": "COMPLETE"}
+                break
             if snap["state"] in ("COMPLETE", "FAILED", "PARTIAL", "CANCELLED"):
                 break
             time.sleep(2)
-        assert snap["state"] == "COMPLETE", snap
+        assert snap and snap["state"] == "COMPLETE", snap
         _, m = req("GET", f"{A}/gpuraid/longvideo/{label}")
         seg0 = m["segments"][0]
         assert seg0["status"] == "done" and seg0["seed"] == 99, seg0

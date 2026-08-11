@@ -14,7 +14,6 @@ from gpu_raid.graph_rewrite import (
     collect_upload_refs,
     descendants,
     extract_requirements,
-    extract_story_director,
     prepare_keyframe_template,
     prepare_segment_template,
     render_keyframe,
@@ -283,7 +282,7 @@ def test_keyframe_template_strips_markers_rejects_workers_nodes():
     # ноды-пульты живут на той же канве — вырезаются молча
     g = kf_graph()
     g["3"]["_meta"] = {"title": "GPURAID:PROMPT"}
-    g["99"] = {"class_type": "GPURAID_StoryDirector", "inputs": {"story": "x"}}
+    g["99"] = {"class_type": "GPURAID_Story", "inputs": {"story": "x"}}
     g["98"] = {"class_type": "GPURAID_Offload", "inputs": {"worker": "w1"}}
     spec = prepare_keyframe_template(g)
     assert "99" not in spec["template"] and "98" not in spec["template"]
@@ -301,31 +300,11 @@ def test_keyframe_template_strips_markers_rejects_workers_nodes():
 
 def story_graph():
     g = lv_graph()
-    g["50"] = {"class_type": "GPURAID_StoryDirector", "inputs": {
+    g["50"] = {"class_type": "GPURAID_Story", "inputs": {
         "story": "Лодка уходит в шторм.", "label": "boat", "segments_count": 2,
         "segment_duration_s": 4.0, "fps": 24, "aspect": "16:9", "short_edge": 768,
         "snap": "minimax_h3", "use_llm": False, "seed": 5}}
     return g
-
-
-def test_extract_story_director():
-    params, g = extract_story_director(story_graph())
-    assert params["story"] == "Лодка уходит в шторм."
-    assert params["label"] == "boat"
-    assert params["segments_count"] == 2
-    assert params["use_llm"] is False
-    assert "50" not in g
-    # без Сценариста — params None, граф не тронут
-    p2, g2 = extract_story_director(lv_graph())
-    assert p2 is None and "1" in g2
-    # два Сценариста — ошибка
-    g3 = story_graph()
-    g3["51"] = dict(g3["50"])
-    try:
-        extract_story_director(g3)
-        assert False
-    except RewriteError:
-        pass
 
 
 def test_segment_template_strips_markers_rejects_stripe_nodes():
@@ -350,11 +329,33 @@ def test_strip_markers_literalizes_story_and_drops_pults():
     g = story_graph()
     g["51"] = {"class_type": "GPURAID_Offload", "inputs": {"worker": "w1"}}
     g["52"] = {"class_type": "GPURAID_LongVideo", "inputs": {"label": "v"}}
-    g["53"] = {"class_type": "ShowText", "inputs": {"text": ["50", 0]}}
+    # slot 0 у Истории — GPURAID_PROJECT (не литерализуется, консьюмер — тоже
+    # маркер и вырезается тем же проходом); slot 1 — STRING текста сюжета
+    g["53"] = {"class_type": "ShowText", "inputs": {"text": ["50", 1]}}
     out = strip_markers(g)
     assert not any(k in out for k in ("50", "51", "52"))
     assert out["53"]["inputs"]["text"] == "Лодка уходит в шторм."
     assert "50" in g, "исходный граф не должен меняться без in_place"
+
+
+def test_strip_markers_drops_runtime_pipe_links():
+    """Провод «Воркеры → лоадер» (GPURAID_RUNTIME) не должен оставлять
+    висячую ссылку: partition()/валидация падают на отсутствующей ноде."""
+    g = {
+        "10": {"class_type": "GPURAID_Workers", "inputs": {}},
+        "2": {"class_type": "UNETLoader",
+              "inputs": {"unet_name": "m.safetensors", "weight_dtype": "default",
+                         "gpuraid_runtime": ["10", 1]}},
+        "3": {"class_type": "BasicScheduler",
+              "inputs": {"model": ["2", 0], "scheduler": "simple", "steps": 4,
+                         "denoise": 1.0}},
+    }
+    out = strip_markers(g)
+    assert "10" not in out
+    assert "gpuraid_runtime" not in out["2"]["inputs"]
+    # обычные ссылки и виджеты не тронуты
+    assert out["2"]["inputs"]["unet_name"] == "m.safetensors"
+    assert out["3"]["inputs"]["model"] == ["2", 0]
 
 
 def test_videospec_overrides_and_segment_render():
@@ -384,4 +385,21 @@ def test_videospec_overrides_and_segment_render():
 def test_splice_removes_story_director():
     g, warnings = splice_gpuraid(story_graph())
     assert "50" not in g
-    assert any("GPURAID_StoryDirector" in w for w in warnings)
+    assert any("GPURAID_Story" in w for w in warnings)
+
+
+def test_steps_override_and_segment_render():
+    g = lv_graph()
+    g["61"] = {"class_type": "KSampler", "inputs": {"steps": 20, "seed": 1},
+               "_meta": {"title": "GPURAID:STEPS"}}
+    spec = prepare_segment_template(g)
+    assert spec["steps"] == "61" and spec["steps_key"] == "steps"
+    out = render_segment(spec, "a.png", "b.png", "p", 1, prefix="tmp/s0",
+                         overrides={"steps": 4})
+    assert out["61"]["inputs"]["steps"] == 4
+    # шаблон не мутирован
+    assert spec["template"]["61"]["inputs"]["steps"] == 20
+    # без маркера GPURAID:STEPS — steps в spec отсутствует, override молча игнорируется
+    spec2 = prepare_segment_template(lv_graph())
+    assert spec2["steps"] is None
+    render_segment(spec2, "a.png", "b.png", "p", 1, prefix="tmp/s1", overrides={"steps": 4})

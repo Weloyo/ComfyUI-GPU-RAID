@@ -1,14 +1,16 @@
 // GPU RAID — входной модуль расширения: настройки, перехват Queue, sidebar, события.
 //
-// Разделение труда в UI: рабочая область (канва) — ноды-пульты с раскадровкой,
-// промптами, кадрами и запуском (web/lib/nodeui.js); левая панель — воркеры,
-// настройки и мониторинг (web/lib/panel.js).
+// Разделение труда в UI: ВСЁ управление на канве — привязки «модель → воркер»
+// в нодах-лоадерах (web/lib/loaderui.js), пульты проектов и парк воркеров в
+// нодах GPU RAID (web/lib/nodeui.js, workersui.js); левая панель — только
+// секреты и подключения (web/lib/panel.js).
 import { app } from "../../scripts/app.js";
 import { api } from "../../scripts/api.js";
 import { gr, toast, clientId } from "./lib/api.js";
 import { GPURaidPanel } from "./lib/panel.js";
 import { broadcast } from "./lib/editor.js";
 import { NODE_LV, NODE_OFFLOAD, NODE_PIPELINE, NODE_STORY } from "./lib/nodeui.js";
+import { RUNTIME_INPUT, workflowHasRemoteAssignments } from "./lib/loaderui.js";
 
 let panel = null;
 
@@ -28,6 +30,16 @@ function injectCss() {
         link.rel = "stylesheet";
         link.href = href;
         document.head.appendChild(link);
+    }
+}
+
+/** Провода привязок «Воркеры → лоадер» в API-граф не нужны: сервер их
+ *  игнорирует, но чистый prompt честнее (и бэкенд их всё равно вычищает). */
+function scrubRuntimeLinks(output) {
+    for (const node of Object.values(output || {})) {
+        if (Array.isArray(node?.inputs?.[RUNTIME_INPUT])) {
+            delete node.inputs[RUNTIME_INPUT];
+        }
     }
 }
 
@@ -53,9 +65,12 @@ function armedNode(output, cls) {
     return null;
 }
 
-// приоритет, если на канве armed сразу несколько пультов
+// приоритет, если на канве armed сразу несколько пультов.
+// Раскадровка/Видеоряд сюда намеренно не входят — у них нет одного
+// однозначного действия на Queue (у Видеоряда их даже два — черновик/финал),
+// только явные кнопки рендера в теле ноды.
 const PULTS = [
-    [NODE_STORY, "Сценарист"],
+    [NODE_STORY, "История"],
     [NODE_PIPELINE, "Конвейер"],
     [NODE_OFFLOAD, "Выполнить на воркере"],
     [NODE_LV, "Длинное видео"],
@@ -66,6 +81,7 @@ const NOOP_QUEUE = { prompt_id: "", number: -1, node_errors: {} };
 function hookQueue() {
     const original = api.queuePrompt.bind(api);
     api.queuePrompt = async function (number, data, ...rest) {
+        try { scrubRuntimeLinks(data?.output); } catch (e) { /* ignore */ }
         try {
             if (!setting("GPURaid.Enabled", true)) return original(number, data, ...rest);
             const output = data?.output;
@@ -86,7 +102,30 @@ function hookQueue() {
                 return NOOP_QUEUE;
             }
 
-            // 2) страйпинг: Distributor+Collector в графе
+            // 2) привязки лоадеров: на канве сказано «этой модели считаться там-то»
+            //    — Queue запускает конвейер-шардинг по этим привязкам
+            if (!graphHasStripe(output) && workflowHasRemoteAssignments(data?.workflow)) {
+                try {
+                    const r = await gr.post("/pipeline/start", {
+                        graph: output,
+                        workflow_ui: data.workflow,
+                        label: "canvas",
+                        client_id: clientId(),
+                    });
+                    toast("info", "GPU RAID: конвейер по привязкам лоадеров",
+                        `${r.stages} стадий — прогресс в нодах «Конвейер» и «Воркеры»`);
+                    return { prompt_id: r.job_id, number: -1, node_errors: {} };
+                } catch (e) {
+                    // сознательно БЕЗ локального фоллбека: модель привязана к
+                    // удалённому GPU не просто так — локальный прогон 20 ГБ
+                    // весов повесит машину
+                    toast(e.status === 409 ? "warn" : "error",
+                        "GPU RAID: конвейер не запущен", e.message, 10000);
+                    return NOOP_QUEUE;
+                }
+            }
+
+            // 3) страйпинг: Distributor+Collector в графе
             if (!graphHasStripe(output)) return original(number, data, ...rest);
             try {
                 const r = await gr.post("/stripe", {
@@ -165,7 +204,7 @@ app.registerExtension({
                 id: "gpu-raid",
                 icon: "pi pi-server",
                 title: "GPU RAID",
-                tooltip: "GPU RAID — воркеры, режимы и задания",
+                tooltip: "GPU RAID — подключения и ключи (всё остальное на канве)",
                 type: "custom",
                 render: (el) => { panel = new GPURaidPanel(el); },
                 destroy: () => { panel?.dispose(); panel = null; },

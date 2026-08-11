@@ -138,6 +138,38 @@ def platform_shutdown(platform):
 # gist-rendezvous: воркер сам сообщает мастеру свой адрес
 # ---------------------------------------------------------------------------
 
+# описание rendezvous-гиста, которое пишет мастер (providers.create_gist) —
+# по нему воркер находит gist сам, GIST_ID руками вводить не нужно
+GIST_MARKER = "ComfyUI GPU RAID"
+
+
+def pick_rendezvous_gist(gists, marker=GIST_MARKER):
+    """Из ответа GitHub GET /gists выбирает rendezvous-gist мастера.
+
+    Узнаём по началу описания; если совпадений несколько (пересозданные) —
+    берём самый свежий по updated_at. Чистая функция, покрыта тестами.
+    """
+    hits = [g for g in gists or []
+            if isinstance(g, dict) and g.get("id")
+            and str(g.get("description") or "").startswith(marker)]
+    hits.sort(key=lambda g: str(g.get("updated_at") or ""), reverse=True)
+    return str(hits[0]["id"]) if hits else ""
+
+
+def discover_gist(gh_token):
+    """Находит rendezvous-gist по одному лишь GH_TOKEN (stdlib urllib)."""
+    req = urllib.request.Request(
+        "https://api.github.com/gists?per_page=100",
+        headers={
+            "Authorization": f"Bearer {gh_token}",
+            "Accept": "application/vnd.github+json",
+            "User-Agent": "comfyui-gpu-raid-worker",
+        },
+    )
+    with urllib.request.urlopen(req, timeout=20) as r:
+        return pick_rendezvous_gist(json.load(r))
+
+
 def publish_rendezvous(gh_token, gist_id, session, name, platform, string, state="up"):
     """PATCH одного файла w_<session>.json в приватном gist (stdlib urllib).
 

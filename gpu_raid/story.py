@@ -1,12 +1,14 @@
-"""«Сценарист»: сюжет -> план (LLM/эвристика) -> ключевые кадры (T2I,
-параллельно) -> сегменты FLF2V (параллельно) -> одно видео.
+"""«История» / «Раскадровка» / «Видеоряд»: сюжет -> план (LLM/эвристика) ->
+ключевые кадры (T2I, параллельно) -> сегменты FLF2V (параллельно) -> одно
+видео. Три ноды-пульта над одним и тем же проектом, связаны коннектором
+GPURAID_PROJECT (или дропдауном «проект:» вручную).
 
 Строится поверх подсистемы Long Video: тот же манифест (schema 2), тот же
-каталог проектов output/gpuraid/<label>/, тот же редактор (он живёт в ноде
-Сценариста на канве, см. web/lib/editor.js). N сегментов
-= N+1 ключевых кадров; кадр i — конец сегмента i-1 и начало сегмента i, поэтому
-кадры рендерятся ровно в WxH канвы сегментов (иначе H3 скомпонует stretch/cover
-по-разному и стык будет виден).
+каталог проектов output/gpuraid/<label>/, тот же редактор (он живёт в теле
+каждой из трёх нод, отрисовывает свою стадию — см. web/lib/editor.js). N
+сегментов = N+1 ключевых кадров; кадр i — конец сегмента i-1 и начало
+сегмента i, поэтому кадры рендерятся ровно в WxH канвы сегментов (иначе H3
+скомпонует stretch/cover по-разному и стык будет виден).
 
 Кадры складываются в input/gpuraid_story/<label>/ (input-каталог: существующий
 upload-механизм сам разносит их по воркерам для FLF2V-графов).
@@ -23,7 +25,6 @@ from . import secrets as secret_store
 from .dispatcher import DEAD, DONE, MANAGER, Job, Unit
 from .graph_rewrite import (
     RewriteError,
-    extract_story_director,
     prepare_keyframe_template,
     prepare_segment_template,
     render_keyframe,
@@ -39,8 +40,10 @@ TEMPLATES_DIR = os.path.join(os.path.dirname(os.path.abspath(__file__)), "templa
 
 
 def _bundled_keyframe_template():
-    """Встроенный SDXL T2I-шаблон кадров (используется, если свой не задан)."""
-    path = os.path.join(TEMPLATES_DIR, "keyframe_sdxl_api.json")
+    """Встроенный T2I-шаблон кадров (используется, если свой не задан) —
+    Z-Image-Turbo: реальная локальная цель проекта, в отличие от SDXL, чьих
+    весов у пользователя вообще нет на диске."""
+    path = os.path.join(TEMPLATES_DIR, "keyframe_zimage_turbo_api.json")
     data = config.load_json(path, None)
     return data if isinstance(data, dict) else None
 
@@ -56,6 +59,9 @@ def _kf_abs_dir(label):
 
 
 def _spec_from_manifest(manifest):
+    if not manifest.get("template_graph"):
+        raise RewriteError("У проекта нет шаблона сегмента — задайте его "
+                           "(нода Видеоряд → «Шаблон сегмента из канвы»)")
     spec = dict(manifest["spec_meta"])
     spec["template"] = manifest["template_graph"]
     spec["job_type"] = "video"
@@ -63,25 +69,65 @@ def _spec_from_manifest(manifest):
 
 
 def _kf_spec_from_manifest(manifest):
+    """Шаблон кадра проекта, а если его никогда не задавали (кнопка «Шаблон
+    кадра из канвы» ни разу не нажата) — встроенный дефолт (Z-Image), не
+    сохраняя его в манифест: как только пользователь захватит свой, он и
+    станет использоваться, без риска залипшей бандл-копии."""
     template = manifest.get("keyframe_template")
+    meta = manifest.get("keyframe_meta")
     if not template:
-        raise RewriteError("У проекта нет шаблона ключевых кадров — задайте его "
-                           "(нода Сценариста → «Шаблон кадра из канвы»)")
-    spec = dict(manifest.get("keyframe_meta") or {})
+        bundled = _bundled_keyframe_template()
+        if not bundled:
+            raise RewriteError("У проекта нет шаблона ключевых кадров — задайте его "
+                               "(нода Раскадровка → «Шаблон кадра из канвы»)")
+        kf_spec = prepare_keyframe_template(bundled)
+        template = kf_spec["template"]
+        meta = {"prompt": kf_spec["prompt"], "prompt_key": kf_spec["prompt_key"]}
+        events.toast("info", "Раскадровка: использую встроенный Z-Image-шаблон кадров — "
+                             "замените кнопкой «Шаблон кадра из канвы», если нужно")
+    spec = dict(meta or {})
     spec["template"] = template
     spec["job_type"] = "image"
     return spec
 
 
-def _seg_overrides(manifest, seg):
+def _seg_overrides(manifest, seg, variant="final"):
     vid = manifest.get("spec") or {}
-    return {
+    overrides = {
         "duration_s": seg.get("duration_s"),
         "fps": vid.get("fps"),
         "aspect": vid.get("aspect"),
         "short_edge": vid.get("short_edge"),
         "snap": vid.get("snap"),
     }
+    if variant == "preview":
+        vs = manifest.get("video_settings") or {}
+        short_edge = vs.get("preview_short_edge")
+        if not short_edge:
+            base = int(vid.get("short_edge") or 768)
+            short_edge = max(32, round(base / 2 / 32) * 32)
+        overrides["short_edge"] = short_edge
+        steps = vs.get("preview_steps")
+        if steps:
+            overrides["steps"] = int(steps)
+    return overrides
+
+
+def _seg_target(seg, variant):
+    """Под-словарь сегмента для ЗАПИСИ результата рендера: сам сегмент для
+    variant="final", вложенный ["preview"] для variant="preview" (создаётся
+    при первой записи, setdefault — поэтому только для записи, не для чтения)."""
+    if variant == "preview":
+        return seg.setdefault("preview", {"file": None, "status": "draft",
+                                          "worker": None, "error": ""})
+    return seg
+
+
+def _seg_read(seg, variant):
+    """Тот же выбор под-словаря, но для ЧТЕНИЯ — не создаёт "preview" на лету."""
+    if variant == "preview":
+        return seg.get("preview") or {}
+    return seg
 
 
 # ---------------------------------------------------------------------------
@@ -89,6 +135,10 @@ def _seg_overrides(manifest, seg):
 # ---------------------------------------------------------------------------
 
 async def call_llm(story, params):
+    """base_url/api_key — глобальное подключение (панель, «Подключения и ключи»).
+    model/temperature/max_tokens/system_prompt — «характер» конкретного проекта,
+    приходят с ноды Истории через params (не из глобальных настроек) — так
+    можно держать разных «сценаристов» под разные сюжеты одновременно."""
     cfg = REGISTRY.settings().get("llm") or {}
     base_url = str(cfg.get("base_url") or "").rstrip("/")
     if not base_url:
@@ -97,11 +147,16 @@ async def call_llm(story, params):
     key = secret_store.get("llm_api_key")
     if key:
         headers["Authorization"] = f"Bearer {key}"
+    model = str(params.get("model") or cfg.get("model") or "")
+    temperature = params.get("temperature")
     payload = {
-        "model": str(cfg.get("model") or ""),
+        "model": model,
         "messages": storyplan.llm_messages(story, params),
-        "temperature": float(cfg.get("temperature") or 0.7),
+        "temperature": float(temperature) if temperature is not None else float(cfg.get("temperature") or 0.7),
     }
+    max_tokens = params.get("max_tokens")
+    if max_tokens:
+        payload["max_tokens"] = int(max_tokens)
     async with aiohttp.ClientSession() as s:
         async with s.post(base_url + "/chat/completions", json=payload, headers=headers,
                           timeout=aiohttp.ClientTimeout(
@@ -112,37 +167,24 @@ async def call_llm(story, params):
             data = await r.json()
     content = ((data.get("choices") or [{}])[0].get("message") or {}).get("content", "")
     plan_data = storyplan.parse_llm_plan(content)
-    return plan_data, str(data.get("model") or cfg.get("model") or "")
+    return plan_data, str(data.get("model") or model or "")
 
 
 # ---------------------------------------------------------------------------
 # план
 # ---------------------------------------------------------------------------
 
-async def plan(graph, params, keyframe_graph, client_id):
-    """Разбирает сюжет в черновой манифест. Ничего не рендерит."""
-    director, seg_graph = extract_story_director(graph)
-    p = dict(director or {})
-    for key, value in (params or {}).items():
-        if value is not None:
-            p[key] = value
+async def plan(params, client_id):
+    """Разбирает сюжет в черновой манифест. Ничего не рендерит.
 
+    Больше не требует графа канвы — шаблоны сегмента (FLF2V) и кадра (T2I)
+    захватываются отдельно, уже над готовым проектом: нодой Видеоряд
+    (set_segment_template) и нодой Раскадровка (set_keyframe_template).
+    """
+    p = dict(params or {})
     story_text = str(p.get("story") or "").strip()
     if not story_text:
-        raise RewriteError("Пустой сюжет: заполните поле story в ноде Сценариста")
-
-    spec = prepare_segment_template(seg_graph)
-    if spec["end"] is None:
-        raise RewriteError(
-            'Сценаристу нужен FLF2V-шаблон: пометьте второй LoadImage заголовком '
-            '"GPURAID:END_IMAGE"'
-        )
-    if not keyframe_graph:
-        keyframe_graph = _bundled_keyframe_template()
-        if keyframe_graph:
-            events.toast("info", "Сценарист: использую встроенный SDXL-шаблон кадров — "
-                                 "замените кнопкой «Шаблон кадра из канвы», если нужно")
-    kf_spec = prepare_keyframe_template(keyframe_graph) if keyframe_graph else None
+        raise RewriteError("Пустой сюжет: заполните поле story в ноде Истории")
 
     vid = {
         "fps": int(p.get("fps") or 24),
@@ -150,44 +192,54 @@ async def plan(graph, params, keyframe_graph, client_id):
         "short_edge": int(p.get("short_edge") or 768),
         "snap": str(p.get("snap") or "minimax_h3"),
         "segment_duration_s": float(p.get("segment_duration_s") or 5.0),
+        "max_segment_duration_s": float(p["max_segment_duration_s"])
+            if p.get("max_segment_duration_s") else None,
+        "max_total_duration_s": float(p["max_total_duration_s"])
+            if p.get("max_total_duration_s") else None,
     }
     vid["width"], vid["height"] = storyplan.canvas(vid["aspect"], vid["short_edge"],
                                                    vid["snap"])
 
-    llm_meta = {"used": False, "model": "", "error": ""}
+    llm_params = {
+        "segments_count": p.get("segments_count") or 0,
+        "segment_duration_s": vid["segment_duration_s"],
+        "max_segment_duration_s": vid["max_segment_duration_s"],
+        "max_total_duration_s": vid["max_total_duration_s"],
+        "model": p.get("model"),
+        "temperature": p.get("temperature"),
+        "max_tokens": p.get("max_tokens"),
+        "system_prompt": p.get("system_prompt"),
+    }
+    llm_meta = {"used": False, "model": "", "error": "",
+               "system_prompt": str(p.get("system_prompt") or ""),
+               "temperature": p.get("temperature"), "max_tokens": p.get("max_tokens")}
     plan_data = None
     if p.get("use_llm", True):
         try:
-            plan_data, model = await call_llm(story_text, {
-                "segments_count": p.get("segments_count") or 0,
-                "segment_duration_s": vid["segment_duration_s"],
-            })
-            llm_meta = {"used": True, "model": model, "error": ""}
+            plan_data, model = await call_llm(story_text, llm_params)
+            llm_meta.update({"used": True, "model": model, "error": ""})
         except Exception as e:
             cfg = REGISTRY.settings().get("llm") or {}
             reason = storyplan.llm_error_text(e, storyplan.llm_timeout(cfg))
-            llm_meta = {"used": False, "model": "", "error": reason}
-            events.toast("warn", f"Сценарист: LLM недоступен ({reason}) — "
+            llm_meta.update({"used": False, "model": "", "error": reason})
+            events.toast("warn", f"История: LLM недоступен ({reason}) — "
                                  "разбиваю эвристикой, промпты правьте в ноде")
     if plan_data is None:
         plan_data = storyplan.heuristic_split(story_text,
                                               int(p.get("segments_count") or 0))
 
+    storyplan.clamp_segment_and_total_duration(
+        plan_data["segments"], vid["max_segment_duration_s"], vid["max_total_duration_s"])
+
     outdir, label = lv._unique_outdir(str(p.get("label") or "story"))
     manifest = storyplan.new_story_manifest(label, story_text, plan_data, vid,
                                             int(p.get("seed") or 0), llm_meta,
                                             kf_dir=_kf_rel_dir(label))
-    manifest["template_graph"] = spec["template"]
-    manifest["spec_meta"] = {k: spec[k] for k in ("start", "start_key", "end", "end_key",
-                                                  "prompt", "prompt_key", "out")}
-    if kf_spec:
-        manifest["keyframe_template"] = kf_spec["template"]
-        manifest["keyframe_meta"] = {"prompt": kf_spec["prompt"],
-                                     "prompt_key": kf_spec["prompt_key"]}
     lv.save_manifest(manifest)
     events.toast("success",
-                 f"Сценарист: план «{label}» готов — {len(manifest['segments'])} сегментов, "
-                 f"{len(manifest['keyframes'])} кадров. Правьте в ноде Сценариста.")
+                 f"История: план «{label}» готов — {len(manifest['segments'])} сегментов, "
+                 f"{len(manifest['keyframes'])} кадров. Подключите Раскадровку и Видеоряд "
+                 "(коннектором или дропдауном «проект:»).")
     return manifest
 
 
@@ -203,20 +255,74 @@ async def set_keyframe_template(label, graph):
     return True
 
 
+async def set_segment_template(label, graph):
+    manifest = lv.load_manifest(label)
+    if not manifest:
+        raise RewriteError(f"Проект {label} не найден")
+    spec = prepare_segment_template(graph)
+    if spec["end"] is None:
+        raise RewriteError(
+            'Видеоряду нужен FLF2V-шаблон: пометьте второй LoadImage заголовком '
+            '"GPURAID:END_IMAGE"'
+        )
+    manifest["template_graph"] = spec["template"]
+    manifest["spec_meta"] = {k: spec[k] for k in
+                             ("start", "start_key", "end", "end_key", "prompt", "prompt_key",
+                              "steps", "steps_key", "out")}
+    lv.save_manifest(manifest)
+    return True
+
+
+async def update_video_settings(label, patch):
+    manifest = lv.load_manifest(label)
+    if not manifest:
+        raise RewriteError(f"Проект {label} не найден")
+    vs = manifest.setdefault("video_settings", {"prompt_format": "minimax_h3",
+                                                "preview_short_edge": None, "preview_steps": None})
+    for key in ("prompt_format", "preview_short_edge", "preview_steps"):
+        if key in (patch or {}):
+            vs[key] = patch[key]
+    lv.save_manifest(manifest)
+    return vs
+
+
+async def update_storyboard_settings(label, patch):
+    manifest = lv.load_manifest(label)
+    if not manifest:
+        raise RewriteError(f"Проект {label} не найден")
+    ss = manifest.setdefault("storyboard_settings", {"continuity_mode": "style_only"})
+    if "continuity_mode" in (patch or {}):
+        ss["continuity_mode"] = patch["continuity_mode"]
+    lv.save_manifest(manifest)
+    return ss
+
+
 # ---------------------------------------------------------------------------
 # рендер ключевых кадров
 # ---------------------------------------------------------------------------
 
+def _kf_prompt_with_bible(manifest, raw_prompt):
+    """style_bible клеится к промпту кадра тут, в момент рендера — не при
+    создании плана (иначе правка стиля задним числом не решала бы N+1 кадров
+    и N сегментов уже сгенерированных промптов)."""
+    bible = str(manifest.get("style_bible") or "").strip().rstrip(".")
+    raw = str(raw_prompt or "").strip()
+    if bible and raw:
+        return f"{bible}. {raw}"
+    return raw or bible
+
+
 def _make_kf_unit(job, manifest, kf_spec, kf, outdir):
     i = kf["index"]
     vid = manifest["spec"]
+    prompt = _kf_prompt_with_bible(manifest, kf.get("prompt"))
     unit = Unit(i, meta={
         "label": f"key {i:03d}",
         "out_file": os.path.join(outdir, f"key_{i:03d}.png"),
-        "prompt": kf.get("prompt"),
+        "prompt": prompt,
         "seed": int(kf.get("seed") or 0),
     })
-    graph = render_keyframe(kf_spec, kf.get("prompt") or "", int(kf.get("seed") or 0),
+    graph = render_keyframe(kf_spec, prompt, int(kf.get("seed") or 0),
                             vid["width"], vid["height"],
                             prefix=f"gpuraid_tmp/{job.job_id}/k{i:03d}")
     return unit, graph
@@ -338,7 +444,7 @@ def _kf_file_rel(manifest, index):
     return f"{_kf_rel_dir(manifest['label'])}/{kf['file']}"
 
 
-async def render_segments(label, indices=None, client_id=""):
+async def render_segments(label, indices=None, variant="final", client_id=""):
     manifest = lv.load_manifest(label)
     if not manifest:
         raise RewriteError(f"Проект {label} не найден")
@@ -350,7 +456,9 @@ async def render_segments(label, indices=None, client_id=""):
     if not targets:
         raise RewriteError("Нет сегментов для рендера")
 
-    job = Job("longvideo", client_id=client_id, label=f"{label}/segments")
+    suffix = " (черновик)" if variant == "preview" else ""
+
+    job = Job("longvideo", client_id=client_id, label=f"{label}/segments{suffix}")
     job.job_type = "video"
     job.timeouts = MANAGER._timeouts_for("video")
     job.outdir = os.path.join(config.deliver_base(), config.sanitize_name(label))
@@ -360,25 +468,34 @@ async def render_segments(label, indices=None, client_id=""):
         i = seg["index"]
         start_rel = _kf_file_rel(manifest, seg["start_kf"])
         end_rel = _kf_file_rel(manifest, seg["end_kf"])
+        render_prompt = storyplan.render_prompt_for_segment(
+            manifest, seg.get("prompt"), seg.get("duration_s"))
+        if variant == "preview":
+            filename = (seg.get("preview") or {}).get("file") or f"seg_{i:03d}_preview.mp4"
+        else:
+            filename = seg.get("file") or f"seg_{i:03d}.mp4"
         unit = Unit(i, meta={
-            "label": f"seg {i:03d}",
-            "out_file": os.path.join(job.outdir, seg.get("file") or f"seg_{i:03d}.mp4"),
+            "label": f"seg {i:03d}{suffix}",
+            "out_file": os.path.join(job.outdir, filename),
             "out_node": spec["out"],
             "start_image": start_rel,
             "end_image": end_rel,
             "prompt": seg.get("prompt"),
             "seed": int(seg.get("seed") or 0),
+            "variant": variant,
         })
-        graph = render_segment(spec, start_rel, end_rel, seg.get("prompt"),
+        graph = render_segment(spec, start_rel, end_rel, render_prompt,
                                int(seg.get("seed") or 0),
                                prefix=f"gpuraid_tmp/{job.job_id}/s{i:03d}",
-                               overrides=_seg_overrides(manifest, seg))
+                               overrides=_seg_overrides(manifest, seg, variant))
         job.units.append(unit)
         job.unit_graphs[i] = graph
         job.unit_uploads[i] = lv._uploads_for_graph(graph, job.job_id)
-        seg["status"] = "rendering"
-        seg["error"] = ""
-        seg["stale"] = False
+        target = _seg_target(seg, variant)
+        target["status"] = "rendering"
+        target["error"] = ""
+        if variant == "final":
+            seg["stale"] = False
     job.build_graph = lambda u: job.unit_graphs[u.index]
 
     job.eligible = await MANAGER._eligible_workers(job)
@@ -386,7 +503,8 @@ async def render_segments(label, indices=None, client_id=""):
         raise RewriteError("Нет доступных воркеров для рендера сегментов")
     for unit in job.units:
         job.queue.put_nowait((1, unit.index))
-    manifest["state"] = "running"
+    if variant == "final":
+        manifest["state"] = "running"
     lv.save_manifest(manifest)
 
     def on_unit_done(_job, unit):
@@ -396,18 +514,21 @@ async def render_segments(label, indices=None, client_id=""):
         seg = next((s for s in m.get("segments", []) if s["index"] == unit.index), None)
         if seg is None:
             return
-        seg["status"] = "done"
-        seg["worker"] = unit.worker_id
-        seg["error"] = ""
-        seg["stale"] = False
-        seg["start_image"] = unit.meta.get("start_image")
-        seg["end_image"] = unit.meta.get("end_image")
+        target = _seg_target(seg, variant)
+        target["status"] = "done"
+        target["file"] = os.path.basename(unit.meta["out_file"])
+        target["worker"] = unit.worker_id
+        target["error"] = ""
+        if variant == "final":
+            seg["stale"] = False
+            seg["start_image"] = unit.meta.get("start_image")
+            seg["end_image"] = unit.meta.get("end_image")
         lv.save_manifest(m)
 
     job.on_unit_done = on_unit_done
 
     async def finalize(j):
-        await _finalize_segments(j, label)
+        await _finalize_segments(j, label, variant)
 
     job.state = "DISPATCHING"
     MANAGER._register(job)
@@ -415,8 +536,13 @@ async def render_segments(label, indices=None, client_id=""):
     return job
 
 
-async def _finalize_segments(job, label):
-    """Мерж статусов по индексам (не затирая чужие сегменты) + авто-склейка."""
+async def _finalize_segments(job, label, variant="final"):
+    """Мерж статусов по индексам (не затирая чужие сегменты) + авто-склейка.
+
+    variant="preview": пишет в segments[i]["preview"] и manifest["final_preview"],
+    НЕ трогает manifest["state"]/["final"] — черновой прогон не должен
+    переключать статус готовности проекта, только финальный рендер это делает.
+    """
     manifest = lv.load_manifest(label)
     if not manifest:
         return
@@ -425,30 +551,39 @@ async def _finalize_segments(job, label):
                    None)
         if seg is None:
             continue
+        target = _seg_target(seg, variant)
         if unit.state == DONE:
-            seg["status"] = "done"
-            seg["worker"] = unit.worker_id
-            seg["error"] = ""
+            target["status"] = "done"
+            target["worker"] = unit.worker_id
+            target["error"] = ""
         else:
-            seg["status"] = "failed"
-            seg["error"] = unit.error or ""
-    segments = manifest.get("segments", [])
-    done = sum(1 for s in segments if s.get("status") == "done")
-    if job.cancelled:
-        manifest["state"] = "cancelled"
-        job.finished = "CANCELLED"
-    elif done == len(segments):
-        manifest["state"] = "done"
-        job.finished = "COMPLETE"
-    elif done:
-        manifest["state"] = "partial"
-        job.finished = "PARTIAL"
-        events.toast("warn", f"Сценарист «{label}»: готово {done}/{len(segments)} сегментов")
-    else:
-        manifest["state"] = "failed"
-        job.finished = "FAILED"
+            target["status"] = "failed"
+            target["error"] = unit.error or ""
 
-    if manifest["state"] == "done":
+    segments = manifest.get("segments", [])
+    done = sum(1 for s in segments if _seg_read(s, variant).get("status") == "done")
+    label_kind = "черновик" if variant == "preview" else "финал"
+    if job.cancelled:
+        job.finished = "CANCELLED"
+        if variant == "final":
+            manifest["state"] = "cancelled"
+    elif done == len(segments):
+        job.finished = "COMPLETE"
+        if variant == "final":
+            manifest["state"] = "done"
+    elif done:
+        job.finished = "PARTIAL"
+        if variant == "final":
+            manifest["state"] = "partial"
+            events.toast("warn", f"«{label}»: готово {done}/{len(segments)} сегментов")
+    else:
+        job.finished = "FAILED"
+        if variant == "final":
+            manifest["state"] = "failed"
+
+    ready = (variant == "final" and manifest["state"] == "done") \
+        or (variant == "preview" and segments and done == len(segments))
+    if ready:
         edit = manifest.get("edit") or {}
         excluded = {int(i) for i in (edit.get("excluded") or [])}
         order = edit.get("order") or [s["index"] for s in segments]
@@ -460,16 +595,20 @@ async def _finalize_segments(job, label):
                 if int(i) in excluded:
                     continue
                 seg = seg_by_index.get(int(i))
-                if seg:
-                    files.append(os.path.join(outdir, seg["file"]))
+                file = _seg_read(seg, variant).get("file") if seg else None
+                if file:
+                    files.append(os.path.join(outdir, file))
             if files and not (edit.get("crossfade_s") or manifest.get("crossfade_s")):
-                final = os.path.join(outdir, f"{manifest['label']}_full.mp4")
+                out_suffix = "_preview" if variant == "preview" else "_full"
+                final = os.path.join(outdir, f"{manifest['label']}{out_suffix}.mp4")
                 await video.concat_copy(files, final)
-                manifest["final"] = os.path.basename(final)
+                manifest["final_preview" if variant == "preview" else "final"] = \
+                    os.path.basename(final)
                 events.toast("success",
-                             f"Сценарист «{label}»: {len(files)} сегментов склеены → {final}")
+                             f"«{label}»: {len(files)} сегментов ({label_kind}) "
+                             f"склеены → {final}")
         except Exception as e:
-            log.warning("story auto-concat failed: %s", e)
-            events.toast("warn", f"Сценарист «{label}»: сегменты готовы, авто-склейка "
+            log.warning("story auto-concat failed (variant=%s): %s", variant, e)
+            events.toast("warn", f"«{label}»: сегменты ({label_kind}) готовы, авто-склейка "
                                  f"не удалась ({e}) — используйте Export")
     lv.save_manifest(manifest)

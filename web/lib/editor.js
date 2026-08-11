@@ -1,6 +1,9 @@
-// Редактор проекта: лента ключевых кадров, сегменты, рендер, монтаж и экспорт.
-// Живёт ВНУТРИ ноды на канве (см. nodeui.js). Панель расширения проекты только
-// перечисляет — вся работа с промптами и кадрами идёт в рабочей области.
+// Редактор проекта: сцены/кадры/сегменты, рендер, монтаж и экспорт. Один класс
+// на все стадии (story/storyboard/videoseq — три ноды одного story-проекта — и
+// старый одностадийный LongVideo chain/keyframes), стадия задаёт, какие блоки
+// показывать (см. конструктор и render()). Живёт ВНУТРИ ноды на канве
+// (см. nodeui.js). Панель расширения проекты только перечисляет — вся работа
+// с промптами и кадрами идёт в рабочей области.
 import { app } from "../../../scripts/app.js";
 import { gr, toast, viewURL, clientId } from "./api.js";
 import { el, esc, fmtDur } from "./format.js";
@@ -21,9 +24,14 @@ const STATE_LABEL = {
 };
 
 export class ProjectEditor {
-    constructor(root) {
+    constructor(root, stage) {
         this.root = root;
         this.root.classList.add("gr-editor");
+        // "story" (История — план, ничего не отрендерено), "storyboard"
+        // (Раскадровка — только кадры), "videoseq" (Видеоряд — только
+        // сегменты+экспорт), иначе (LongVideo chain/keyframes) — оба блока
+        // по наличию данных, как раньше
+        this.stage = stage;
         this.label = "";
         this.manifest = null;
         this.error = "";
@@ -34,7 +42,6 @@ export class ProjectEditor {
         this._editTimer = null;
         this._dirty = false;
         this._focusHook = false;
-        this._autoSeg = false;      // «Всё ▶»: досылать сегменты после кадров
         EDITORS.add(this);
         this.render();
     }
@@ -107,13 +114,6 @@ export class ProjectEditor {
             if (!this.label || data.label !== this.label) return;
             if (data.deleted) { this.manifest = null; this.render(); return; }
             if (!data.manifest) return;
-            if (this._autoSeg && data.manifest.state === "kf_done") {
-                this._autoSeg = false;
-                gr.post(`/story/${encodeURIComponent(this.label)}/render`,
-                    { client_id: clientId() })
-                    .then(() => toast("info", "Кадры готовы — пошёл рендер сегментов"))
-                    .catch((e) => toast("error", "Сегменты не запущены", e.message));
-            }
             this.applyManifest({ ...(this.manifest || {}), ...data.manifest });
             return;
         }
@@ -147,22 +147,26 @@ export class ProjectEditor {
                 { indices: idx && idx.length ? idx : null, client_id: clientId() });
             toast("info", `Кадры: рендер ${(idx && idx.length) || (m.keyframes || []).length} шт.`);
         } catch (e) {
-            this._autoSeg = false;
             toast("error", "Кадры не запущены", e.message);
         }
     }
 
-    async renderSegments(all = false) {
+    /** variant: "final" (полное качество) | "preview" (дешёвый черновик,
+     *  только для story-режима — см. GPURaidVideoSequence). */
+    async renderSegments(all = false, variant = "final") {
         const m = this.manifest;
         const story = m.mode === "story";
+        const isPreview = variant === "preview";
         const idx = all ? null : (m.segments || [])
-            .filter((s) => s.status !== "done" || s.stale || s.dirty).map((s) => s.index);
+            .filter((s) => isPreview ? (s.preview || {}).status !== "done"
+                : (s.status !== "done" || s.stale || s.dirty))
+            .map((s) => s.index);
         try {
             if (story) {
                 await gr.post(`/story/${encodeURIComponent(this.label)}/render`,
-                    { indices: idx && idx.length ? idx : null, client_id: clientId() });
+                    { indices: idx && idx.length ? idx : null, variant, client_id: clientId() });
             } else {
-                // chain/keyframes: общего «дорендери» нет — перерендериваем поштучно
+                // chain/keyframes: нет preview-режима, общего «дорендери» нет — поштучно
                 const todo = idx && idx.length ? idx
                     : (all ? (m.segments || []).map((s) => s.index) : []);
                 if (!todo.length) {
@@ -174,7 +178,7 @@ export class ProjectEditor {
                         { index: i });
                 }
             }
-            toast("info", "Сегменты: рендер запущен");
+            toast("info", `Сегменты${isPreview ? " (черновик)" : ""}: рендер запущен`);
         } catch (e) { toast("error", "Сегменты не запущены", e.message); }
     }
 
@@ -239,9 +243,22 @@ export class ProjectEditor {
             box.appendChild(el("div", { class: "gr-muted" },
                 `⚠ LLM: ${esc(m.llm.error)} — план собран эвристикой`));
         }
-        if ((m.keyframes || []).length) box.appendChild(this.keyframesBlock(m));
-        box.appendChild(this.segmentsBlock(m));
-        box.appendChild(this.footer(m));
+        if (m.style_bible) {
+            box.appendChild(el("div", { class: "gr-muted" }, `Стиль: ${esc(m.style_bible)}`));
+        }
+        if (this.stage === "story") {
+            box.appendChild(this.sceneListBlock(m));
+        } else if (this.stage === "storyboard") {
+            if ((m.keyframes || []).length) box.appendChild(this.keyframesBlock(m));
+        } else if (this.stage === "videoseq") {
+            box.appendChild(this.segmentsBlock(m));
+            box.appendChild(this.footer(m));
+        } else {
+            // LongVideo (chain/keyframes) — поведение как раньше
+            if ((m.keyframes || []).length) box.appendChild(this.keyframesBlock(m));
+            box.appendChild(this.segmentsBlock(m));
+            box.appendChild(this.footer(m));
+        }
     }
 
     headerRow(m) {
@@ -291,25 +308,32 @@ export class ProjectEditor {
 
     toolbar(m) {
         const bar = el("div", { class: "gr-btns" });
-        const story = m.mode === "story";
-        if ((m.keyframes || []).length) {
+        const stage = this.stage;
+        // stage не задан (undefined) — старый одностадийный LongVideo (chain/keyframes):
+        // и кадры, и сегменты живут на одной ноде, как раньше
+        const isChain = stage !== "story" && stage !== "storyboard" && stage !== "videoseq";
+        if ((stage === "storyboard" || isChain) && (m.keyframes || []).length) {
             const kf = el("button", { class: "gr-btn gr-primary",
                 title: "рендер ключевых кадров (только неготовых) параллельно на всех GPU" },
                 "Кадры ▶");
             kf.onclick = () => this.renderKeyframes(false);
             bar.appendChild(kf);
         }
-        const seg = el("button", { class: "gr-btn gr-primary",
-            title: "рендер сегментов (неготовых и устаревших) параллельно" }, "Сегменты ▶");
-        seg.onclick = () => this.renderSegments(false);
-        bar.appendChild(seg);
-        if (story && (m.keyframes || []).length) {
-            const all = el("button", { class: "gr-btn",
-                title: "кадры, затем автоматически сегменты" }, "Всё ▶");
-            all.onclick = () => { this._autoSeg = true; this.renderKeyframes(false); };
-            bar.appendChild(all);
+        if (stage === "videoseq" || isChain) {
+            const seg = el("button", { class: "gr-btn gr-primary",
+                title: "рендер сегментов (неготовых и устаревших) параллельно, "
+                    + "полное качество" }, stage === "videoseq" ? "Финал ▶" : "Сегменты ▶");
+            seg.onclick = () => this.renderSegments(false, "final");
+            bar.appendChild(seg);
+            if (stage === "videoseq") {
+                const prev = el("button", { class: "gr-btn",
+                    title: "дешёвый черновой рендер (сниженное разрешение) — проверить "
+                        + "монтаж до финального прогона" }, "Черновик ▶");
+                prev.onclick = () => this.renderSegments(false, "preview");
+                bar.appendChild(prev);
+            }
         }
-        if (story) {
+        if (stage === "storyboard") {
             const tmpl = el("button", { class: "gr-btn gr-small",
                 title: "сделать текущий workflow на канве T2I-шаблоном ключевых кадров "
                     + "(нужны GPURAID:PROMPT и SaveImage)" }, "Шаблон кадра из канвы");
@@ -322,6 +346,21 @@ export class ProjectEditor {
                 } catch (e) { toast("error", "Шаблон не принят", e.message); }
             };
             bar.appendChild(tmpl);
+        }
+        if (stage === "videoseq") {
+            const segTmpl = el("button", { class: "gr-btn gr-small",
+                title: "сделать текущий workflow на канве FLF2V-шаблоном сегмента "
+                    + "(нужны GPURAID:START_IMAGE/END_IMAGE и Save-видео-нода)" },
+                "Шаблон сегмента из канвы");
+            segTmpl.onclick = async () => {
+                try {
+                    const p = await app.graphToPrompt();
+                    await gr.post(`/story/${encodeURIComponent(this.label)}/segment_template`,
+                        { graph: p.output });
+                    toast("success", "Шаблон сегмента сохранён");
+                } catch (e) { toast("error", "Шаблон не принят", e.message); }
+            };
+            bar.appendChild(segTmpl);
         }
         const upd = el("button", { class: "gr-btn gr-small" }, "⟳");
         upd.title = "перечитать проект с диска";
@@ -339,6 +378,42 @@ export class ProjectEditor {
         };
         bar.appendChild(del);
         return bar;
+    }
+
+    // ---- сцены (стадия "story" — план ещё ничего не отрендерил)
+
+    sceneListBlock(m) {
+        const box = el("details", { class: "gr-subdetails", open: "" });
+        box.appendChild(el("summary", {}, `Сцены (${(m.segments || []).length})`));
+        for (const s of m.segments || []) {
+            box.appendChild(this.sceneRow(s));
+        }
+        return box;
+    }
+
+    sceneRow(s) {
+        const row = el("div", { class: "gr-seg" });
+        const meta = el("div", { class: "gr-seg-meta" });
+        meta.appendChild(el("div", {},
+            `<b>#${s.index}</b> <span class="gr-muted">~${esc(String(s.duration_s ?? "?"))}с</span>`));
+        const pr = el("textarea", { class: "gr-textarea gr-seg-prompt", rows: "2",
+            placeholder: "действие сегмента (промпт)" });
+        pr.value = s.prompt || "";
+        meta.appendChild(pr);
+        const ctl = el("div", { class: "gr-btns" });
+        const save = el("button", { class: "gr-btn gr-small",
+            title: "сохранить промпт сцены" }, "Сохранить");
+        save.onclick = async () => {
+            try {
+                await gr.patch(`/longvideo/${encodeURIComponent(this.label)}/segments/${s.index}`,
+                    { prompt: pr.value });
+                toast("success", `Сцена ${s.index} сохранена`);
+            } catch (e) { toast("error", "Не сохранено", e.message); }
+        };
+        ctl.appendChild(save);
+        meta.appendChild(ctl);
+        row.appendChild(meta);
+        return row;
     }
 
     // ---- ключевые кадры
@@ -525,6 +600,11 @@ export class ProjectEditor {
             bar.appendChild(el("a", { class: "gr-btn", target: "_blank",
                 href: viewURL(m.final, `gpuraid/${m.label}`, "output", true) },
                 "▶ итоговое видео"));
+        }
+        if (m.final_preview) {
+            bar.appendChild(el("a", { class: "gr-btn", target: "_blank",
+                href: viewURL(m.final_preview, `gpuraid/${m.label}`, "output", true) },
+                "▶ черновик"));
         }
         if (m.wall_s) bar.appendChild(el("span", { class: "gr-muted" }, fmtDur(m.wall_s)));
         return bar;

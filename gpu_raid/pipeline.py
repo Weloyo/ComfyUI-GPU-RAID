@@ -1,10 +1,12 @@
 """Pipeline-шардинг: одна большая модель по компонентам на разных GPU.
 
 analyze() режет текущий workflow на острова (pipeline_split), оценивает VRAM и
-трафик разрезов, предлагает размещение. start() собирает граф каждой стадии
-(Save/LoadBundle на границах), гонит стадии топологическими волнами: мастер —
-звезда: скачивает бандлы стадии через /view в свой input-каталог, а существующий
-upload-механизм сам доставляет их следующим стадиям (LoadBundle в UPLOAD_TABLE).
+трафик разрезов, предлагает размещение. Раскладку решают привязки нод-лоадеров
+на канве (properties.gpuraid_runtime, см. placement.py); незатронутые острова
+дозаполняет auto_place. start() собирает граф каждой стадии (Save/LoadBundle
+на границах), гонит стадии топологическими волнами: мастер — звезда: скачивает
+бандлы стадии через /view в свой input-каталог, а существующий upload-механизм
+сам доставляет их следующим стадиям (LoadBundle в UPLOAD_TABLE).
 
 После последней стадии воркера ему шлётся /free — VRAM освобождается сразу.
 """
@@ -17,6 +19,7 @@ import shutil
 import folder_paths
 
 from . import events, pipeline_split as ps
+from . import placement as pm
 from .dispatcher import DEAD, DONE, MANAGER, Job, Unit, UnitCancelled, UnitFailure
 from .graph_rewrite import (RewriteError, classify_job_type, collect_upload_refs,
                             strip_markers)
@@ -92,15 +95,85 @@ def _online_workers():
     return out
 
 
-async def analyze(graph):
+def _worker_views():
+    """Все включённые записи (и офлайн тоже) — для резолва привязок лоадеров."""
+    out = []
+    for record in REGISTRY.enabled_records():
+        st = REGISTRY.status.get(record["id"], {})
+        out.append({
+            "id": record["id"], "name": record["name"],
+            "platform": record.get("platform") or st.get("platform") or "",
+            "kind": record.get("kind"),
+            "state": "online" if record["id"] == LOCAL_ID else st.get("state", "unknown"),
+            "enabled": True,
+        })
+    return out
+
+
+def _loader_weights(graph, sizes):
+    """{nid: суммарный вес моделей лоадера в байтах} — арбитр конфликтов привязок.
+
+    Файла может не быть у мастера (модель живёт только на воркере) — тогда
+    берём размер из библиотеки источников.
+    """
+    from . import modelsrc
+    from .consts import LOADER_TABLE
+
+    weights = {}
+    for nid, node in graph.items():
+        table = LOADER_TABLE.get(node.get("class_type"))
+        if not table:
+            continue
+        total = 0
+        for key, folder in table.items():
+            name = (node.get("inputs") or {}).get(key)
+            if not isinstance(name, str) or not name:
+                continue
+            size = sizes.get((folder, name)) or 0
+            if not size:
+                source = modelsrc.resolve(name, folder)
+                if source and source.get("size_gb"):
+                    size = int(float(source["size_gb"]) * (1024 ** 3))
+            total += size
+        weights[nid] = total
+    return weights
+
+
+def _placement_from_canvas(graph, part, workflow_ui, sizes):
+    """Раскладка островов по привязкам лоадеров из workflow.
+
+    -> (resolved {island_id: worker_id}, island_assign {island_id: привязка},
+        decided_by {island_id: nid}, problems [str], warnings [str])
+    """
+    views = _worker_views()
+    assignments = pm.extract_assignments(workflow_ui or {})
+    island_assign, decided_by, warnings = pm.place_islands(
+        graph, part, assignments, _loader_weights(graph, sizes))
+    resolved, problems = {}, []
+    for isl_id, assign in island_assign.items():
+        wid, reason = pm.resolve_assignment(assign, views)
+        if wid:
+            resolved[isl_id] = wid
+        else:
+            problems.append(f"«{pm.assign_label(assign)}»: {reason}")
+    return resolved, island_assign, decided_by, sorted(set(problems)), warnings
+
+
+async def analyze(graph, workflow_ui=None):
     graph = strip_markers(graph)   # нода «Конвейер» сама живёт на этой же канве
     part = ps.partition(graph, _type_table())
     sizes = _model_sizes(graph)
     workers = _online_workers()
-    placement = ps.auto_place(graph, part, workers, sizes) if workers else {}
+    resolved, island_assign, decided_by, problems, place_warnings = \
+        _placement_from_canvas(graph, part, workflow_ui, sizes)
+    if workers:
+        placement = ps.auto_place(graph, part, workers, sizes, preplaced=resolved)
+    else:
+        placement = dict(resolved)
 
     islands_view = []
     for isl in part["islands"]:
+        deciding = decided_by.get(isl["id"])
         islands_view.append({
             "id": isl["id"],
             "classes": sorted({graph[nid].get("class_type", "?") for nid in isl["nodes"]}),
@@ -109,9 +182,15 @@ async def analyze(graph):
             "models": {f: sorted(n) for f, n in ps.island_models(graph, isl).items()},
             "vram_est_gb": ps.estimate_island_vram_gb(graph, isl, sizes),
             "worker_id": placement.get(isl["id"]),
+            # привязка с канвы (если есть) и кто её решил — для отчёта в ноде
+            "assign": island_assign.get(isl["id"], ""),
+            "assign_label": pm.assign_label(island_assign[isl["id"]])
+                            if isl["id"] in island_assign else "",
+            "decided_by": (graph.get(deciding) or {}).get("class_type") if deciding else "",
         })
     cuts_view = []
-    warnings = list(part["warnings"])
+    warnings = list(part["warnings"]) + place_warnings + [
+        f"привязка {p} — стадия не разложена" for p in problems]
     for cut in part["cuts"]:
         mb = ps.estimate_cut_mb(cut)
         cross = placement.get(cut["src_island"]) != placement.get(cut["dst_island"])
@@ -129,19 +208,36 @@ async def analyze(graph):
                 "на одном воркере")
         cuts_view.append(view)
     return {"islands": islands_view, "cuts": cuts_view, "placement": placement,
-            "workers": workers, "warnings": warnings}
+            "workers": workers, "warnings": warnings,
+            "assigned": sorted(island_assign), "problems": problems}
 
 
 async def start(graph, workflow_ui, placement, label, client_id):
     graph = strip_markers(graph)
     part = ps.partition(graph, _type_table())
+    sizes = _model_sizes(graph)
+    resolved, island_assign, _decided, problems, place_warnings = \
+        _placement_from_canvas(graph, part, workflow_ui, sizes)
+    if problems:
+        # привязка на канве есть, а воркера под ней нет — запуск бессмыслен:
+        # auto_place молча увёз бы модель на чужой GPU
+        raise RewriteError(
+            "не выполнимы привязки лоадеров: " + "; ".join(problems)
+            + ". Запустите рантаймы кнопкой ▶ в нодах-лоадерах и дождитесь "
+            "статуса «в сети»")
+    for text in place_warnings:
+        events.toast("warn", f"Конвейер: {text}")
     if placement:
-        placement = {int(k): str(v) for k, v in placement.items()}
-    else:
+        # легаси-вызов с явной раскладкой (старый UI ноды) — он главнее
+        for k, v in placement.items():
+            resolved[int(k)] = str(v)
+    if len(resolved) < len(part["islands"]):
         workers = _online_workers()
         if not workers:
             raise RewriteError("Нет воркеров для конвейера")
-        placement = ps.auto_place(graph, part, workers, _model_sizes(graph))
+        placement = ps.auto_place(graph, part, workers, sizes, preplaced=resolved)
+    else:
+        placement = resolved
     for isl in part["islands"]:
         wid = placement.get(isl["id"])
         if not wid or REGISTRY.get(wid) is None:

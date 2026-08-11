@@ -285,15 +285,18 @@ def output_island_ids(graph, part):
     return out
 
 
-def auto_place(graph, part, workers, model_sizes=None, pin_output_to="local"):
+def auto_place(graph, part, workers, model_sizes=None, pin_output_to="local",
+               preplaced=None):
     """workers: [{"id", "vram_gb"}] -> {island_id: worker_id}.
 
-    Жадно: остров с выходными нодами — на pin_output_to (IMAGE после VAEDecode
-    через туннель — гигабайты); остальные по убыванию VRAM-оценки на самый
-    свободный подходящий GPU, с тяготением к воркеру соседних островов.
+    preplaced: {island_id: worker_id} — уже решённые острова (привязки лоадеров
+    на канве); они не переигрываются, только вычитаются из бюджетов VRAM.
+    Остальное жадно: остров с выходными нодами — на pin_output_to (IMAGE после
+    VAEDecode через туннель — гигабайты); прочие по убыванию VRAM-оценки на
+    самый свободный подходящий GPU, с тяготением к воркеру соседних островов.
     """
     model_sizes = model_sizes or {}
-    placement = {}
+    placement = dict(preplaced or {})
     budget = {w["id"]: float(w.get("vram_gb") or 0) for w in workers}
     if not budget:
         raise RewriteError("Нет воркеров для размещения")
@@ -301,12 +304,13 @@ def auto_place(graph, part, workers, model_sizes=None, pin_output_to="local"):
     outputs = output_island_ids(graph, part)
     if pin_output_to in budget:
         for i in outputs:
-            placement[i] = pin_output_to
+            placement.setdefault(i, pin_output_to)
 
     est = {isl["id"]: estimate_island_vram_gb(graph, isl, model_sizes)
            for isl in part["islands"]}
     for i, wid in placement.items():
-        budget[wid] -= est[i]
+        if wid in budget:   # preplaced-воркер мог не попасть в пул (нет VRAM-данных)
+            budget[wid] -= est[i]
 
     neighbors = {}
     for cut in part["cuts"]:

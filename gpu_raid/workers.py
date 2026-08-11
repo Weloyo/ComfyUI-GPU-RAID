@@ -191,6 +191,24 @@ class WorkerRegistry:
                 w[key] = patch[key]
         if "pinned" in patch:
             w["pinned"] = bool(patch["pinned"])
+        if "lifecycle" in patch:
+            # персональный сценарий автостопа: {"policy": ..., "idle_stop_min": N};
+            # пустой/inherit — снять переопределение (наследовать глобальный)
+            lc = patch["lifecycle"] if isinstance(patch["lifecycle"], dict) else {}
+            clean = {}
+            policy = str(lc.get("policy") or "").strip()
+            if policy and policy != "inherit":
+                clean["policy"] = policy
+            try:
+                idle = int(lc.get("idle_stop_min") or 0)
+            except (TypeError, ValueError):
+                idle = 0
+            if idle > 0:
+                clean["idle_stop_min"] = idle
+            if clean:
+                w["lifecycle"] = clean
+            else:
+                w.pop("lifecycle", None)
         if "model_remap" in patch and isinstance(patch["model_remap"], dict):
             w["model_remap"] = patch["model_remap"]
         if "add_remap" in patch:

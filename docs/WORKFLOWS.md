@@ -2,7 +2,7 @@
 
 ## Страйпинг (Distributor + Collector)
 
-Минимальная схема — [example_workflows/stripe_sdxl.json](example_workflows/stripe_sdxl.json):
+Минимальная схема — [example_workflows/stripe_sdxl.json](../example_workflows/stripe_sdxl.json):
 
 1. `GPURAID Distributor` → выход **seed** в **KSampler.seed**
    (ПКМ по KSampler → *Convert widget to input* → seed, если вход не виден).
@@ -61,6 +61,6 @@ workflow и запускайте его через Offload.
 ## Tiled Upscale
 
 `LoadImage → GPURAID Tiled Upscale → SaveImage`
-([пример](example_workflows/tiled_upscale.json)). Модель-апскейлер должна быть
+([пример](../example_workflows/tiled_upscale.json)). Модель-апскейлер должна быть
 на воркерах (или скачайте её кнопкой из панели — она маленькая). `tile` 768 и
 `overlap` 64 — разумный дефолт; при видимых швах увеличьте overlap.

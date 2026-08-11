@@ -26,6 +26,31 @@ NONE = "none"
 
 POLICIES = ("keep", "eco", "instant", "local_only")
 
+
+def effective_policy(cfg, platform=None, record_override=None):
+    """Итоговая политика воркера: глобальная -> платформа -> запись воркера.
+
+    cfg — settings["lifecycle"] целиком (в нём же platform_overrides:
+    {"colab": {"policy": "keep", "idle_stop_min": 5}}); record_override —
+    поле lifecycle записи воркера. policy="inherit"/пусто на любом уровне
+    означает «не переопределяю». budget_min всегда глобальный.
+    """
+    out = dict(cfg or {})
+    overrides = (cfg or {}).get("platform_overrides") or {}
+    for ovr in (overrides.get(platform or ""), record_override):
+        if not isinstance(ovr, dict):
+            continue
+        policy = str(ovr.get("policy") or "").strip()
+        if policy and policy != "inherit":
+            out["policy"] = policy
+        try:
+            idle = int(ovr.get("idle_stop_min") or 0)
+        except (TypeError, ValueError):
+            idle = 0
+        if idle > 0:
+            out["idle_stop_min"] = idle
+    return out
+
 # сколько секунд простоя нужно instant-политике: защита от гонки, когда
 # пользователь ставит задания в очередь одно за другим
 INSTANT_GRACE_S = 30

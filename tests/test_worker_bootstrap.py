@@ -111,3 +111,20 @@ def test_gen_token_is_random_and_urlsafe():
     assert a != b and len(a) >= 16
     assert all(c.isalnum() or c in "-_" for c in a), a
     assert wb.gen_token("свой-токен") == "свой-токен"
+
+
+def test_pick_rendezvous_gist():
+    mk = lambda i, d, ts: {"id": i, "description": d, "updated_at": ts}
+    gists = [
+        mk("aaa", "мой дневник", "2026-01-01T00:00:00Z"),
+        mk("bbb", "ComfyUI GPU RAID — rendezvous (воркеры публикуют сюда адреса)",
+           "2026-01-02T00:00:00Z"),
+        mk("ccc", "ComfyUI GPU RAID — rendezvous (воркеры публикуют сюда адреса)",
+           "2026-03-01T00:00:00Z"),
+        {"description": "ComfyUI GPU RAID", "updated_at": "2026-04-01T00:00:00Z"},
+    ]
+    # самый свежий из подходящих; записи без id пропускаются
+    assert wb.pick_rendezvous_gist(gists) == "ccc"
+    assert wb.pick_rendezvous_gist([mk("x", "чужой gist", "2026-01-01")]) == ""
+    assert wb.pick_rendezvous_gist([]) == ""
+    assert wb.pick_rendezvous_gist(None) == ""

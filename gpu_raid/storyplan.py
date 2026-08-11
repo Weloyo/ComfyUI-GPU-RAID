@@ -154,7 +154,7 @@ def heuristic_split(story, target_segments=0, max_chars=350):
             chunks.append(cur)
 
     segments = [{"prompt": c, "keyframe_prompt": c, "duration_s": None} for c in chunks]
-    return {"style": "", "segments": segments,
+    return {"style_bible": "", "segments": segments,
             "final_keyframe_prompt": chunks[-1] if chunks else ""}
 
 
@@ -186,23 +186,37 @@ def llm_messages(story, params):
     """Сообщения для OpenAI-совместимого /chat/completions (строгий JSON-план)."""
     n = int(params.get("segments_count") or 0)
     dur = float(params.get("segment_duration_s") or 5.0)
+    max_seg = params.get("max_segment_duration_s")
+    max_total = params.get("max_total_duration_s")
     count_rule = (f"Раздели сюжет ровно на {n} сегментов."
                   if n else "Сам выбери число сегментов (от 2 до 16) по драматургии сюжета.")
+    duration_rule = f" Каждый сегмент по умолчанию ~{dur:g} секунд (можно варьировать по смыслу сцены)."
+    if max_seg:
+        duration_rule += f" Ни один сегмент не должен превышать {float(max_seg):g} секунд."
+    if max_total:
+        duration_rule += f" Сумма всех сегментов не должна превышать {float(max_total):g} секунд."
     system = (
-        "Ты — режиссёр раскадровки для видео-диффузионной модели.\n"
-        + count_rule
-        + f" Каждый сегмент по умолчанию ~{dur:g} секунд (можно варьировать).\n"
+        "Ты — режиссёр раскадровки и оператор для видео-диффузионной модели: "
+        "придумываешь и сюжетную структуру, и то, как её снять камерой.\n"
+        + count_rule + duration_rule + "\n"
         "Ответь СТРОГО одним JSON-объектом, без пояснений и markdown:\n"
-        '{"style": "общая стилистика: камера, свет, эстетика",\n'
+        '{"style_bible": "устойчивые визуальные приметы всей истории: как выглядят '
+        'персонажи, место действия, освещение, эпоха и техника съёмки — то, что '
+        'должно оставаться неизменным от кадра к кадру",\n'
         ' "segments": [{"prompt": "...", "keyframe_prompt": "...", '
         f'"duration_s": {dur:g}}}],\n'
         ' "final_keyframe_prompt": "..."}\n'
-        "Правила: prompt сегмента описывает действие и движение камеры внутри "
-        "сегмента; keyframe_prompt — статичный кадр НАЧАЛА сегмента; "
-        "final_keyframe_prompt — финальный кадр всего видео. Соседние сегменты "
-        "стыкуются: начало сегмента i+1 продолжает конец сегмента i. "
-        "Все prompt пиши на английском."
+        "Правила: prompt сегмента описывает действие И движение камеры внутри "
+        "сегмента (тип — наезд/отъезд/панорама/трекинг/статика и т.п., амплитуда "
+        "и скорость — прозой, не списком тегов); keyframe_prompt — статичный "
+        "кадр НАЧАЛА сегмента; final_keyframe_prompt — финальный кадр всего "
+        "видео. Соседние сегменты стыкуются: начало сегмента i+1 продолжает "
+        "конец сегмента i. Не повторяй style_bible внутри prompt/keyframe_prompt "
+        "— он добавляется автоматически при рендере. Все prompt пиши на английском."
     )
+    profile = str(params.get("system_prompt") or "").strip()
+    if profile:
+        system += "\n\nДополнительно об этом сценаристе (характер, стиль подачи): " + profile
     return [
         {"role": "system", "content": system},
         {"role": "user", "content": str(story or "").strip()},
@@ -245,10 +259,87 @@ def parse_llm_plan(text):
     if not out:
         raise ValueError("в плане нет валидных сегментов")
     return {
-        "style": str(data.get("style") or "").strip(),
+        "style_bible": str(data.get("style_bible") or data.get("style") or "").strip(),
         "segments": out,
         "final_keyframe_prompt": str(data.get("final_keyframe_prompt") or "").strip(),
     }
+
+
+def clamp_segment_and_total_duration(segments, max_segment_s=None, max_total_s=None):
+    """Клампит duration_s по двум потолкам: сначала каждый сегмент отдельно
+    (максимум на сегмент), затем — если сумма всё ещё больше потолка на весь
+    ролик — пропорционально сжимает все сегменты разом. Пропорциональное
+    сжатие, а не обрезка хвоста: иначе конец истории молча терялся бы.
+
+    segments: список словарей с "duration_s" (как из parse_llm_plan/
+    heuristic_split, ДО new_story_manifest). Мутирует и возвращает тот же список.
+    """
+    if max_segment_s:
+        cap = float(max_segment_s)
+        for seg in segments:
+            cur = seg.get("duration_s")
+            if cur is not None and cur > cap:
+                seg["duration_s"] = cap
+    if max_total_s:
+        total = sum(float(seg.get("duration_s") or 5.0) for seg in segments)
+        cap = float(max_total_s)
+        if total > cap > 0:
+            scale = cap / total
+            for seg in segments:
+                seg["duration_s"] = float(seg.get("duration_s") or 5.0) * scale
+    return segments
+
+
+def scene_timeline(segments):
+    """Кумулятивные секунды начала/конца каждого сегмента — не хранится в
+    манифесте, считается по требованию (иначе рассинхронизируется с диска,
+    если пользователь поправит duration_s одного сегмента задним числом).
+    """
+    out = []
+    t = 0.0
+    for seg in segments:
+        dur = float(seg.get("duration_s") or 0.0)
+        out.append({"index": seg.get("index"), "start_s": round(t, 2),
+                    "end_s": round(t + dur, 2)})
+        t += dur
+    return out
+
+
+def render_prompt_for_segment(manifest, action_prompt, duration_s):
+    """Промпт сегмента для рендера: style_bible проекта + (MiniMax-формат,
+    если manifest.video_settings.prompt_format == "minimax_h3", иначе сырой
+    action_prompt с приклеенным style_bible). Общая точка для массового
+    рендера (story.render_segments) и поштучного «заново»
+    (longvideo.rerender_segment) — чтобы оба пути давали одинаковый
+    результат для одного и того же сегмента.
+    """
+    style_bible = str(manifest.get("style_bible") or "").strip().rstrip(".")
+    prompt_format = (manifest.get("video_settings") or {}).get("prompt_format", "minimax_h3")
+    action = str(action_prompt or "").strip()
+    if prompt_format == "minimax_h3":
+        return format_minimax_segment_prompt(action, duration_s, style_bible)
+    if style_bible and action:
+        return f"{style_bible}. {action}"
+    return action or style_bible
+
+
+def format_minimax_segment_prompt(action_prompt, duration_s, style_bible=""):
+    """Промпт сегмента в официальном формате MiniMax H3 FL2VA (first+last frame).
+
+    По docs/VIDEO_PROMPT_WRITING_GUIDE_base_en.md (MiniMaxAI/MiniMax-H3,
+    первоисточник): один сегмент = один [Shot 1] (без таймстампа — сегмент
+    целиком один непрерывный шот), обязательная фраза выравнивания первого и
+    последнего кадра по секундам, длительность двумя знаками после запятой.
+    """
+    dur = f"{float(duration_s or 0):.2f}"
+    bible = str(style_bible or "").strip().rstrip(".")
+    action = str(action_prompt or "").strip()
+    prefix = f"{bible}. " if bible else ""
+    return (
+        f"[Shot 1] {prefix}Picture 1 (from Shot 1) aligns with the 0.00-second "
+        f"mark; Picture 2 (from Shot 1) aligns with the {dur}-second mark. "
+        f"{action}"
+    )
 
 
 # ---------------------------------------------------------------------------
@@ -265,26 +356,21 @@ def new_story_manifest(label, story, plan_data, vid, seed, llm_meta=None, kf_dir
     из манифеста).
     """
     kf_dir = kf_dir or f"gpuraid_story/{label}"
-    style = str(plan_data.get("style") or "").strip().rstrip(".")
-
-    def styled(p):
-        p = str(p or "").strip()
-        if style and p:
-            return f"{style}. {p}"
-        return p or style
+    style_bible = str(plan_data.get("style_bible") or "").strip()
 
     seed = int(seed or 0)
     segs_in = plan_data.get("segments") or []
     keyframes, segments = [], []
     for i, item in enumerate(segs_in):
+        kf_prompt = str(item.get("keyframe_prompt") or item.get("prompt") or "").strip()
         keyframes.append({
-            "index": i, "prompt": styled(item.get("keyframe_prompt") or item.get("prompt")),
+            "index": i, "prompt": kf_prompt,
             "seed": (seed + 1000 + i) % (2 ** 64),
             "file": None, "status": "draft", "worker": None, "error": "",
         })
         duration = float(item.get("duration_s") or vid["segment_duration_s"])
         segments.append({
-            "index": i, "prompt": styled(item.get("prompt")),
+            "index": i, "prompt": str(item.get("prompt") or "").strip(),
             "duration_s": duration,
             "length_frames": align_frames(duration, vid["fps"], vid["snap"]),
             "start_kf": i, "end_kf": i + 1,
@@ -295,10 +381,10 @@ def new_story_manifest(label, story, plan_data, vid, seed, llm_meta=None, kf_dir
             "worker": None, "error": "", "stale": False,
         })
     n = len(segs_in)
-    final_prompt = plan_data.get("final_keyframe_prompt") \
-        or (segs_in[-1].get("prompt") if segs_in else "")
+    final_prompt = str(plan_data.get("final_keyframe_prompt")
+                        or (segs_in[-1].get("prompt") if segs_in else "") or "").strip()
     keyframes.append({
-        "index": n, "prompt": styled(final_prompt),
+        "index": n, "prompt": final_prompt,
         "seed": (seed + 1000 + n) % (2 ** 64),
         "file": None, "status": "draft", "worker": None, "error": "",
     })
@@ -306,11 +392,15 @@ def new_story_manifest(label, story, plan_data, vid, seed, llm_meta=None, kf_dir
         "schema": SCHEMA, "label": label, "mode": "story",
         "created": int(time.time()), "state": "draft",
         "story_text": str(story or ""),
+        "style_bible": style_bible,
         "llm": llm_meta or {"used": False, "model": "", "error": ""},
         "spec": dict(vid), "crossfade_s": 0.0,
         "keyframes": keyframes, "segments": segments,
         "edit": default_edit(), "seed": seed, "seed_policy": "increment",
-        "final": None,
+        "final": None, "final_preview": None,
+        "storyboard_settings": {"continuity_mode": "style_only"},
+        "video_settings": {"prompt_format": "minimax_h3",
+                           "preview_short_edge": None, "preview_steps": None},
     }
 
 

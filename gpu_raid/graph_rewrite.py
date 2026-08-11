@@ -19,15 +19,17 @@ from .consts import (
     LV_OUT,
     LV_PROMPT,
     LV_START,
+    LV_STEPS,
     NODE_COLLECTOR,
     NODE_DISTRIBUTOR,
-    NODE_STORY_DIRECTOR,
+    NODE_STORY,
     NODE_TILED_UPSCALE,
     NODE_VIDEO_SPEC,
     PREFIX_PH,
     SAVE_NODE_ID,
     SEED_KEYS,
     SEED_PH,
+    STEPS_KEYS,
     TEXT_KEYS,
     UPLOAD_TABLE,
     VIDEO_HINTS,
@@ -111,21 +113,35 @@ def _literal_int(node, key, what):
 
 
 def strip_markers(graph, in_place=False):
-    """Убирает ноды-пульты мастера (Сценарист, Длинное видео, Offload, Конвейер).
+    """Убирает ноды-пульты мастера (История/Раскадровка/Видеоряд, Длинное
+    видео, Offload, Конвейер).
 
     Они ничего не вычисляют и не должны попадать ни в шаблоны сегментов/кадров,
-    ни на воркеров — только на канвас пользователя. Единственный выход среди
-    них — story у Сценариста: он литерализуется у потребителей.
+    ни на воркеров — только на канвас пользователя. У Истории два выхода
+    (slot 0 — GPURAID_PROJECT, коннектится только к другим маркерам, которые
+    в этом же проходе и вырезаются — литерализовать нечего; slot 1 — STRING
+    текста сюжета: он литерализуется у потребителей).
     """
     g = graph if in_place else copy.deepcopy(graph)
+    removed = set()
     for ct in GPURAID_MARKER_CLASSES:
         for nid in find_by_class(g, ct):
-            if ct == NODE_STORY_DIRECTOR:
+            if ct == NODE_STORY:
                 story = g[nid].get("inputs", {}).get("story", "")
                 if is_link(story):
                     story = ""
-                _replace_links_to(g, nid, {0: str(story or "")})
+                _replace_links_to(g, nid, {1: str(story or "")})
             g.pop(nid)
+            removed.add(str(nid))
+    if removed:
+        # провода от вырезанных маркеров (например, GPURAID_RUNTIME от Воркеров
+        # к лоадерам — привязка «модель → рантайм») данных не несут; оставить
+        # ссылку — значит уронить partition()/валидацию на отсутствующей ноде
+        for node in g.values():
+            inputs = node.get("inputs", {})
+            for key in [k for k, v in inputs.items()
+                        if is_link(v) and str(v[0]) in removed]:
+                inputs.pop(key)
     return g
 
 
@@ -460,6 +476,17 @@ def prepare_segment_template(graph):
         if prompt_key is None:
             raise RewriteError("У ноды GPURAID:PROMPT нет текстового виджета")
 
+    steps_id = _find_titled(g, LV_STEPS)
+    steps_key = None
+    if steps_id is not None:
+        inputs = g[steps_id].get("inputs", {})
+        for key in STEPS_KEYS:
+            if key in inputs and not is_link(inputs[key]):
+                steps_key = key
+                break
+        if steps_key is None:
+            raise RewriteError("У ноды GPURAID:STEPS нет числового виджета steps")
+
     out_id = _find_titled(g, LV_OUT)
     if out_id is None:
         outs = [nid for nid in g if g[nid].get("class_type") in VIDEO_OUT_CLASSES]
@@ -479,6 +506,8 @@ def prepare_segment_template(graph):
         "end_key": UPLOAD_TABLE[g[end_id]["class_type"]][0] if end_id else None,
         "prompt": prompt_id,
         "prompt_key": prompt_key,
+        "steps": steps_id,
+        "steps_key": steps_key,
         "out": out_id,
         "job_type": "video",
     }
@@ -533,6 +562,8 @@ def render_segment(spec, start_image, end_image, prompt, seed, prefix, overrides
 
     _apply_seed(g, seed)
     apply_videospec_overrides(g, overrides)
+    if spec.get("steps") is not None and overrides and overrides.get("steps") is not None:
+        g[spec["steps"]]["inputs"][spec["steps_key"]] = int(overrides["steps"])
 
     out = g[spec["out"]]
     if "filename_prefix" in out.get("inputs", {}):
@@ -627,24 +658,3 @@ def render_keyframe(spec, prompt, seed, width, height, prefix):
                 inputs["height"] = int(height)
     g[SAVE_NODE_ID]["inputs"]["filename_prefix"] = prefix
     return g
-
-
-def extract_story_director(graph):
-    """Достаёт параметры из ноды Сценариста; возвращает (params|None, граф без неё)."""
-    g = copy.deepcopy(graph)
-    ids = find_by_class(g, NODE_STORY_DIRECTOR)
-    if not ids:
-        return None, strip_markers(g, in_place=True)
-    if len(ids) > 1:
-        raise RewriteError("Нужна одна нода Сценариста (найдено несколько)")
-    nid = ids[0]
-    inputs = g[nid].get("inputs", {})
-    params = {}
-    for key in ("story", "label", "segments_count", "segment_duration_s", "fps",
-                "aspect", "short_edge", "snap", "use_llm", "seed"):
-        value = inputs.get(key)
-        if value is not None and not is_link(value):
-            params[key] = value
-    _replace_links_to(g, nid, {0: str(params.get("story") or "")})
-    g.pop(nid)
-    return params, strip_markers(g, in_place=True)
