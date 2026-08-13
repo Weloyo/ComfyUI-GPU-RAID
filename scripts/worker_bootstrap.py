@@ -5,6 +5,7 @@ auth self-test с fallback-прокси, cloudflared/pinggy-туннели, пе
 connection strings. Все функции идемпотентны — ячейку можно перезапускать.
 """
 
+import hashlib
 import json
 import os
 import re
@@ -12,6 +13,7 @@ import secrets
 import shutil
 import subprocess
 import sys
+import threading
 import time
 import urllib.request
 
@@ -215,12 +217,52 @@ def publish_rendezvous(gh_token, gist_id, session, name, platform, string, state
 # установка
 # ---------------------------------------------------------------------------
 
-def install_comfy(comfy_dir):
+def _pip_install_reqs(req_files, comfy_dir, stamp_name, check=True):
+    """pip по списку requirements одним вызовом, со штампом «уже ставили».
+
+    Повторный pip по неизменённым requirements — это десятки секунд чистого
+    резолва на КАЖДЫЙ вызов, а ячейка Colab зовёт install_comfy дважды (сама,
+    до линковки Drive-моделей, и ещё раз внутри bring_up). Штамп = sha256
+    содержимого файлов: обновился ComfyUI или нода — хэш другой, pip
+    прогоняется по-настоящему. Возвращает None, если ставить нечего/уже стоит.
+    """
+    req_files = [r for r in req_files if os.path.isfile(r)]
+    if not req_files:
+        return None
+    digest = hashlib.sha256()
+    for r in req_files:
+        with open(r, "rb") as f:
+            digest.update(f.read())
+        digest.update(b"\0")
+    want = digest.hexdigest()
+    stamp = os.path.join(comfy_dir, f".gpuraid_{stamp_name}.sha256")
+    try:
+        have = open(stamp, encoding="ascii").read().strip()
+    except OSError:
+        have = ""
+    if have == want:
+        print(f"[pip] {stamp_name}: requirements не менялись — пропускаю")
+        return None
+    args = []
+    for r in req_files:
+        args += ["-r", r]
+    res = sh([sys.executable, "-m", "pip", "install", "-q", *args], check=check)
+    if res.returncode == 0:
+        with open(stamp, "w", encoding="ascii") as f:
+            f.write(want)
+    return res
+
+
+def _clone_comfy(comfy_dir):
     if not os.path.isdir(os.path.join(comfy_dir, "comfy")):
         sh(["git", "clone", "--depth", "1",
             "https://github.com/comfyanonymous/ComfyUI", comfy_dir])
-    sh([sys.executable, "-m", "pip", "install", "-q", "-r",
-        os.path.join(comfy_dir, "requirements.txt")])
+
+
+def install_comfy(comfy_dir):
+    _clone_comfy(comfy_dir)
+    _pip_install_reqs([os.path.join(comfy_dir, "requirements.txt")],
+                      comfy_dir, "comfy_reqs")
     return comfy_dir
 
 
@@ -233,14 +275,29 @@ def install_custom_nodes(comfy_dir, gpuraid_src, extra_repos=None):
             os.symlink(os.path.abspath(gpuraid_src), dst)
         except OSError:
             shutil.copytree(gpuraid_src, dst)
-    for repo in (extra_repos if extra_repos is not None else CUSTOM_NODE_REPOS):
-        name = repo.rstrip("/").split("/")[-1]
-        target = os.path.join(cn, name)
+    repos = list(extra_repos if extra_repos is not None else CUSTOM_NODE_REPOS)
+    clones = []
+    for repo in repos:
+        target = os.path.join(cn, repo.rstrip("/").split("/")[-1])
         if not os.path.isdir(target):
-            sh(["git", "clone", "--depth", "1", repo, target], check=False)
-        req = os.path.join(target, "requirements.txt")
-        if os.path.isfile(req):
-            sh([sys.executable, "-m", "pip", "install", "-q", "-r", req], check=False)
+            print(f"+ git clone --depth 1 {repo} {target}", flush=True)
+            clones.append((repo, subprocess.Popen(
+                ["git", "clone", "--depth", "1", repo, target])))
+    for repo, proc in clones:
+        if proc.wait() != 0:
+            print(f"! clone не удался: {repo}")
+    reqs = [os.path.join(cn, r.rstrip("/").split("/")[-1], "requirements.txt")
+            for r in repos]
+    # один pip на все ноды вместо трёх: каждый вызов — свой полный резолв
+    # зависимостей; если совместный резолв конфликтует — откат на по-нодные
+    # установки, как было раньше (check=False: нерабочая нода не валит воркера)
+    joint = _pip_install_reqs(reqs, comfy_dir, "node_reqs", check=False)
+    if joint is not None and joint.returncode != 0:
+        print("! совместная установка нод не удалась — ставлю по одной")
+        for req in reqs:
+            if os.path.isfile(req):
+                sh([sys.executable, "-m", "pip", "install", "-q", "-r", req],
+                   check=False)
 
 
 # ---------------------------------------------------------------------------
@@ -319,6 +376,154 @@ def _atomic_copy(src, dst):
     os.replace(tmp, dst)
 
 
+def _copy_fast(src, dst, workers=4, block=64 * 2**20):
+    """Копия крупного файла параллельным чтением диапазонов + атомарный rename.
+
+    Один поток чтения с Drive FUSE — ~80-120 МБ/с, и 40 ГБ весов ехали из
+    кэша 6-10 минут. Несколько диапазонов одного файла DriveFS обслуживает
+    независимыми HTTP-запросами, поэтому 4 потока дают кратный прирост.
+    Каждый поток открывает СВОИ файловые объекты (никаких общих смещений).
+    Мелкие файлы — обычным copy: накладные расходы дороже выигрыша.
+    Атомарность как у _atomic_copy: пишем в .part, затем os.replace.
+    Печатает скорость — по ней видно, во что упёрлась доставка.
+    """
+    size = os.path.getsize(src)
+    tmp = dst + ".part"
+    t0 = time.time()
+    if workers <= 1 or size < 4 * block:
+        shutil.copy(src, tmp)
+    else:
+        with open(tmp, "wb") as f:
+            f.truncate(size)
+        errors = []
+
+        def pump(lo, hi):
+            try:
+                # buffering=0: raw-read может вернуть меньше запрошенного
+                # (на FUSE — регулярно), поэтому цикл до полного диапазона
+                with open(src, "rb", buffering=0) as fs, open(tmp, "r+b") as fd:
+                    fs.seek(lo)
+                    fd.seek(lo)
+                    left = hi - lo
+                    while left > 0:
+                        chunk = fs.read(min(block, left))
+                        if not chunk:
+                            raise OSError(f"обрыв чтения на смещении {hi - left}")
+                        fd.write(chunk)
+                        left -= len(chunk)
+            except Exception as e:
+                errors.append(e)
+
+        step = (size + workers - 1) // workers
+        threads = [threading.Thread(target=pump, args=(i * step, min(size, (i + 1) * step)))
+                   for i in range(workers) if i * step < size]
+        for t in threads:
+            t.start()
+        for t in threads:
+            t.join()
+        if errors:
+            try:
+                os.remove(tmp)
+            except OSError:
+                pass
+            raise errors[0]
+    os.replace(tmp, dst)
+    dt = max(time.time() - t0, 0.1)
+    if size >= 2**20:
+        print(f"[copy] {os.path.basename(dst)}: {size / 2**30:.1f} ГБ "
+              f"за {dt:.0f}с ({size / 2**20 / dt:.0f} МБ/с)")
+
+
+def _hf_plan(items, comfy_dir, drive_cache_dir=None):
+    """Откуда приедет каждый файл пресета: skip | drive | hf. Без сети.
+
+    По плану решаются две вещи: нужен ли pip huggingface_hub (при тёплом
+    Drive-кэше — нет) и что можно доставлять параллельно с установкой нод.
+    """
+    plan = []
+    for repo_id, filename, folder in items:
+        name = os.path.basename(filename)
+        dst = os.path.join(comfy_dir, "models", folder, name)
+        drive_path = (os.path.join(drive_cache_dir, folder, name)
+                      if drive_cache_dir else None)
+        if os.path.exists(dst):
+            source = "skip"
+        elif drive_path and os.path.exists(drive_path) and os.path.getsize(drive_path) > 0:
+            source = "drive"
+        else:
+            source = "hf"
+        plan.append({"repo_id": repo_id, "filename": filename, "folder": folder,
+                     "dst": dst, "drive_path": drive_path, "source": source})
+    return plan
+
+
+def _hf_pip_if_needed(plan):
+    # хаб нужен только когда реально качаем с HF; и ставить его надо ДО
+    # запуска фоновой доставки — два одновременных pip портят друг другу
+    # site-packages (доставка после этого работает без pip вовсе)
+    if any(item["source"] == "hf" for item in plan):
+        sh([sys.executable, "-m", "pip", "install", "-q",
+            "huggingface_hub[hf_transfer]"], check=False)
+
+
+def _hf_fetch(plan, hf_token=None):
+    """Доставка по плану. Семантика прежняя, транспорт быстрее (_copy_fast)."""
+    for item in plan:
+        source, dst = item["source"], item["dst"]
+        if source == "skip":
+            print(f"[hf] уже есть: {item['filename']}")
+            continue
+        os.makedirs(os.path.dirname(dst), exist_ok=True)
+        if source == "drive":
+            print(f"[hf] копирую из Drive-кэша: {item['filename']}")
+            _copy_fast(item["drive_path"], dst)
+            continue
+        os.environ.setdefault("HF_HUB_ENABLE_HF_TRANSFER", "1")
+        from huggingface_hub import hf_hub_download
+
+        print(f"[hf] скачиваю {item['repo_id']}/{item['filename']} -> {item['folder']}")
+        path = hf_hub_download(repo_id=item["repo_id"], filename=item["filename"],
+                               token=hf_token or None)
+        try:
+            os.symlink(path, dst)
+        except OSError:
+            _atomic_copy(path, dst)
+        item["fetched_from_hf"] = True
+
+
+def _hf_writeback_async(plan):
+    """Сохранение свежескачанного в Drive-кэш — В ФОНЕ. Возвращает поток или None.
+
+    Синхронная запись ~40 ГБ в Drive (FUSE пишет ~40-60 МБ/с) держала
+    критический путь первой сессии лишние 10-20 минут, хотя воркер уже мог
+    рендерить. Обрыв фоновой копии безопасен: _atomic_copy пишет в .part,
+    обрезок под финальным именем не появится — следующая сессия просто
+    скачает с HF заново и попробует сохранить ещё раз.
+    """
+    todo = [item for item in plan
+            if item.get("fetched_from_hf") and item["drive_path"]
+            and not (os.path.exists(item["drive_path"])
+                     and os.path.getsize(item["drive_path"]) > 0)]
+    if not todo:
+        return None
+
+    def run():
+        for item in todo:
+            os.makedirs(os.path.dirname(item["drive_path"]), exist_ok=True)
+            print(f"[hf] сохраняю в Drive-кэш (фон): {item['filename']}")
+            try:
+                _atomic_copy(os.path.realpath(item["dst"]), item["drive_path"])
+            except Exception as e:
+                print(f"! Drive-кэш {item['filename']}: {e}")
+        print("[hf] Drive-кэш пополнен")
+
+    # НЕ daemon: обрыв на полфайла оставит только .part, но зачем терять
+    # почти готовую копию; ячейка watchdog всё равно держит kernel живым
+    t = threading.Thread(target=run, name="drive-writeback")
+    t.start()
+    return t
+
+
 def hf_download(preset_or_list, comfy_dir, hf_token=None, drive_cache_dir=None):
     """Скачивает модели пресета в comfy_dir/models/<folder>/.
 
@@ -333,41 +538,16 @@ def hf_download(preset_or_list, comfy_dir, hf_token=None, drive_cache_dir=None):
     - drive_cache_dir (если передан) используется только как плоское
       персистентное хранилище готовых файлов между сессиями: если файл там
       уже есть — копируем его оттуда вместо скачивания; иначе после скачивания
-      сохраняем туда копию для следующих сессий.
+      сохраняем туда копию для следующих сессий (фоновым потоком — запись в
+      Drive медленная и не должна задерживать запуск воркера).
     """
     items = HF_PRESETS.get(preset_or_list, preset_or_list if isinstance(preset_or_list, list) else [])
     if not items:
         return
-    sh([sys.executable, "-m", "pip", "install", "-q", "huggingface_hub[hf_transfer]"], check=False)
-    os.environ.setdefault("HF_HUB_ENABLE_HF_TRANSFER", "1")
-    from huggingface_hub import hf_hub_download
-
-    for repo_id, filename, folder in items:
-        name = os.path.basename(filename)
-        dst_dir = os.path.join(comfy_dir, "models", folder)
-        os.makedirs(dst_dir, exist_ok=True)
-        dst = os.path.join(dst_dir, name)
-        if os.path.exists(dst):
-            print(f"[hf] уже есть: {filename}")
-            continue
-
-        drive_path = os.path.join(drive_cache_dir, folder, name) if drive_cache_dir else None
-        if drive_path and os.path.exists(drive_path) and os.path.getsize(drive_path) > 0:
-            print(f"[hf] копирую из Drive-кэша: {filename}")
-            _atomic_copy(drive_path, dst)
-            continue
-
-        print(f"[hf] скачиваю {repo_id}/{filename} -> {folder}")
-        path = hf_hub_download(repo_id=repo_id, filename=filename, token=hf_token or None)
-        try:
-            os.symlink(path, dst)
-        except OSError:
-            _atomic_copy(path, dst)
-
-        if drive_path:
-            os.makedirs(os.path.dirname(drive_path), exist_ok=True)
-            print(f"[hf] сохраняю в Drive-кэш: {filename}")
-            _atomic_copy(os.path.realpath(dst), drive_path)
+    plan = _hf_plan(items, comfy_dir, drive_cache_dir)
+    _hf_pip_if_needed(plan)
+    _hf_fetch(plan, hf_token)
+    _hf_writeback_async(plan)
 
 
 def model_inventory(comfy_dir):
@@ -516,7 +696,17 @@ def start_authproxy(gpuraid_src, listen_port, target_port, token):
 # туннели
 # ---------------------------------------------------------------------------
 
+_CLOUDFLARED_LOCK = threading.Lock()
+
+
 def download_cloudflared(dest="/tmp/cloudflared", attempts=3):
+    # лок: bring_up префетчит бинарник фоном, пока ставятся ноды; без лока
+    # префетч и start_cloudflared писали бы один .part вперемешку
+    with _CLOUDFLARED_LOCK:
+        return _download_cloudflared_locked(dest, attempts)
+
+
+def _download_cloudflared_locked(dest, attempts):
     # size>0: обрезок от прошлого обрыва не считаем готовым бинарником —
     # с ним Popen падает PermissionError/ENOEXEC и туннель не поднимается
     if os.path.isfile(dest) and os.path.getsize(dest) > 0:
@@ -590,6 +780,39 @@ def connection_string(token, url, name):
     return f"gpuraid://{token}@{host}?name={name}"
 
 
+def _prefetch_cloudflared():
+    try:
+        download_cloudflared()
+    except Exception as e:
+        # не страшно: start_cloudflared сам качает с ретраями перед туннелем
+        print(f"[tunnel] префетч cloudflared не удался ({e}) — скачаю позже")
+
+
+def _run_async(fn, name):
+    """Поток + отложенный re-raise: ошибка доставки моделей не должна тихо
+    утонуть в фоне. join() бросит её в ячейке так же, как прямой вызов."""
+    box = {}
+
+    def run():
+        try:
+            box["value"] = fn()
+        except BaseException as e:
+            box["error"] = e
+
+    # daemon: если установка упадёт до join(), недокачанный фон не должен
+    # держать интерпретатор (атомарные .part-копии переживают обрыв)
+    t = threading.Thread(target=run, name=name, daemon=True)
+    t.start()
+
+    def join():
+        t.join()
+        if "error" in box:
+            raise box["error"]
+        return box.get("value")
+
+    return join
+
+
 def bring_up(gpuraid_src, comfy_dir, token, gpus=(0,), base_port=8188,
              extra_args=(), use_datasets=True, hf_preset="none", hf_token=None,
              name_prefix="worker", drive_cache_dir=None,
@@ -600,18 +823,38 @@ def bring_up(gpuraid_src, comfy_dir, token, gpus=(0,), base_port=8188,
     Возвращает info для watchdog(): {"strings", "procs", "urls", "instances",
     "platform", "shutdown_file", ...}. Старые ключи сохранены для keepalive().
     """
+    t_setup = time.time()
     if hf_preset == "minimax_h3":
         # ~35-40 ГБ весов при 32 ГБ RAM без свопа (Kaggle/Colab): держать их в RAM
         # нельзя — сессию убивает OOM (Kaggle "status code 42"). Стримим с NVMe.
         need = ("--fast-disk", "--disable-pinned-memory", "--cache-none")
         extra_args = tuple(extra_args) + tuple(f for f in need if f not in extra_args)
         print(f"[minimax_h3] RAM-guard: extra_args = {extra_args}")
-    install_comfy(comfy_dir)
-    install_custom_nodes(comfy_dir, gpuraid_src)
+    # Установка нод, доставка весов и cloudflared не зависят друг от друга,
+    # а раньше шли строго подряд и СКЛАДЫВАЛИСЬ в 10+ минут. Теперь тяжёлая
+    # доставка моделей едет фоном, пока main-поток гоняет pip. Единственный
+    # pip до старта фона — huggingface_hub (_hf_pip_if_needed): два
+    # одновременных pip недопустимы, дальше фон живёт без pip.
+    threading.Thread(target=_prefetch_cloudflared, daemon=True,
+                     name="cf-prefetch").start()
+    _clone_comfy(comfy_dir)
     if use_datasets:
+        # до _hf_plan: файл, пришедший симлинком из датасета, закрывает
+        # позицию пресета — качать его уже не надо
         link_kaggle_datasets(comfy_dir)
+    join_models, plan = None, None
     if hf_preset and hf_preset != "none":
-        hf_download(hf_preset, comfy_dir, hf_token, drive_cache_dir=drive_cache_dir)
+        items = HF_PRESETS.get(hf_preset,
+                               hf_preset if isinstance(hf_preset, list) else [])
+        plan = _hf_plan(items, comfy_dir, drive_cache_dir)
+        _hf_pip_if_needed(plan)
+        join_models = _run_async(lambda: _hf_fetch(plan, hf_token), "models-fetch")
+    _pip_install_reqs([os.path.join(comfy_dir, "requirements.txt")],
+                      comfy_dir, "comfy_reqs")
+    install_custom_nodes(comfy_dir, gpuraid_src)
+    if join_models is not None:
+        join_models()
+        _hf_writeback_async(plan)
     print("[models] инвентарь:")
     model_inventory(comfy_dir)
     if shutil.which("ffmpeg") is None:
@@ -675,6 +918,7 @@ def bring_up(gpuraid_src, comfy_dir, token, gpus=(0,), base_port=8188,
     for s in strings:
         print("   " + s)
     print("=" * 72)
+    print(f"[t] bring_up целиком: {int(time.time() - t_setup)}с")
     return {
         "strings": strings, "procs": procs, "urls": urls,
         "instances": instances, "platform": platform, "token": token,
